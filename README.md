@@ -9,6 +9,9 @@ in a few minutes and dropped straight onto a box.
 | [`perm-audit/perm_audit.rb`](perm-audit/) | Linux | Scans directory trees for world-writable paths missing the sticky bit and unexpected SUID/SGID binaries. |
 | [`ntp-drift/ntp_drift.rb`](ntp-drift/) | Linux / macOS / Windows | Pure-Ruby SNTP client that checks clock drift against a fleet of NTP sources concurrently. |
 | [`service-audit/service_audit.rb`](service-audit/) | Windows | Audits Windows services via WMI for the unquoted-service-path privilege-escalation bug and writable-binary-directory risk. |
+| [`log-analyzer/log_analyzer.rb`](log-analyzer/) | Linux / macOS / Windows | Buckets a log file into time windows and flags spikes in error rate, with text/JSON output and cron-friendly exit codes. |
+| [`registry-drift/registry_drift.rb`](registry-drift/) | Windows | Compares live or snapshotted Windows Registry values against a JSON security baseline and reports pass/drift/missing per key. |
+| [`backup-rotate/backup_rotate.rb`](backup-rotate/) | Linux / macOS | Creates checksummed, gzip-compressed backups and enforces a retention policy so old archives get rotated out automatically. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
