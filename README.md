@@ -12,6 +12,9 @@ in a few minutes and dropped straight onto a box.
 | [`log-analyzer/log_analyzer.rb`](log-analyzer/) | Linux / macOS / Windows | Buckets a log file into time windows and flags spikes in error rate, with text/JSON output and cron-friendly exit codes. |
 | [`registry-drift/registry_drift.rb`](registry-drift/) | Windows | Compares live or snapshotted Windows Registry values against a JSON security baseline and reports pass/drift/missing per key. |
 | [`backup-rotate/backup_rotate.rb`](backup-rotate/) | Linux / macOS | Creates checksummed, gzip-compressed backups and enforces a retention policy so old archives get rotated out automatically. |
+| [`prometheus-exporter/prometheus_exporter.rb`](prometheus-exporter/) | Linux (portable HTTP/registry layer) | Pure-Ruby Prometheus `/metrics` HTTP exporter built on TCPServer — no prometheus-client gem, no framework. |
+| [`config-state-engine/config_state_engine.rb`](config-state-engine/) | Linux / macOS / Windows | A ~180-line idempotent, Chef/Puppet-style configuration engine: declare file/directory/line state, only touches disk on drift. |
+| [`bitlocker-compliance-audit/bitlocker_compliance_audit.rb`](bitlocker-compliance-audit/) | Windows | Audits BitLocker drive-encryption compliance via WMI (`Win32_EncryptableVolume`), classifying gaps by severity. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
