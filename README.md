@@ -15,13 +15,16 @@ in a few minutes and dropped straight onto a box.
 | [`prometheus-exporter/prometheus_exporter.rb`](prometheus-exporter/) | Linux (portable HTTP/registry layer) | Pure-Ruby Prometheus `/metrics` HTTP exporter built on TCPServer — no prometheus-client gem, no framework. |
 | [`config-state-engine/config_state_engine.rb`](config-state-engine/) | Linux / macOS / Windows | A ~180-line idempotent, Chef/Puppet-style configuration engine: declare file/directory/line state, only touches disk on drift. |
 | [`bitlocker-compliance-audit/bitlocker_compliance_audit.rb`](bitlocker-compliance-audit/) | Windows | Audits BitLocker drive-encryption compliance via WMI (`Win32_EncryptableVolume`), classifying gaps by severity. |
+| [`user-account-audit/user_account_audit.rb`](user-account-audit/) | Linux | Audits local user accounts via /etc/passwd and /etc/shadow for duplicate root UIDs, empty password hashes, and other account-hygiene risks. |
+| [`api-health-check/api_health_check.rb`](api-health-check/) | Linux / macOS / Windows | Concurrent Net::HTTP endpoint health checker with retry/backoff and healthy/degraded/down reporting, no gems. |
+| [`scheduled-task-audit/scheduled_task_audit.rb`](scheduled-task-audit/) | Windows | Audits Task Scheduler via WIN32OLE/Schedule.Service for unquoted action paths, writable-directory hijacks, and privileged tasks in untrusted locations. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
 
 ## Quick start
 
-```bash
+```
 git clone <this-repo-url>
 cd ruby-devops-toolkit
 
@@ -38,12 +41,11 @@ ruby service-audit\service_audit.rb
 ## Design notes
 
 - **No gems by default.** Everything here runs on a stock Ruby install — `find`, `etc`,
-  `socket`, `win32ole`, `optparse`, `json` from the standard library. Nothing to `bundle
-  install` on a box you're trying to audit quickly.
+`socket`, `win32ole`, `optparse`, `json` from the standard library. Nothing to `bundle install` on a box you're trying to audit quickly.
 - **Text and `--json` output** on every script, so each one works equally well read by a
-  human on a terminal or piped into a monitoring/alerting pipeline.
+human on a terminal or piped into a monitoring/alerting pipeline.
 - **Exit codes matter.** Every script exits non-zero when it finds something CRIT, so they
-  drop straight into cron, CI, or a Nagios-style check without extra wrapping.
+drop straight into cron, CI, or a Nagios-style check without extra wrapping.
 
 ## Testing notes
 
@@ -53,6 +55,13 @@ NTP client's protocol math was validated against a loopback mock SNTP server wit
 simulated clock offset. The Windows service auditor's detection logic was verified with a
 WIN32OLE stub test harness feeding realistic `Win32_Service` fixtures, since it depends on
 WMI, which requires a real Windows host. See each script's README for the specifics.
+
+The user account auditor and API health checker were both tested live in a Linux sandbox
+(against real `/etc/passwd`/`/etc/shadow` fixtures and a local WEBrick mock server,
+respectively). The scheduled task auditor's WIN32OLE integration could not be run against a
+real Windows host in this environment; its risk-scoring logic (`evaluate_task`) is instead
+fully unit-tested with realistic WIN32OLE-shaped fixtures — see
+`scheduled-task-audit/scheduled_task_audit_test.rb`.
 
 ## License
 
