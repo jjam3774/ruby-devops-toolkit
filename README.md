@@ -18,6 +18,9 @@ in a few minutes and dropped straight onto a box.
 | [`user-account-audit/user_account_audit.rb`](user-account-audit/) | Linux | Audits local user accounts via /etc/passwd and /etc/shadow for duplicate root UIDs, empty password hashes, and other account-hygiene risks. |
 | [`api-health-check/api_health_check.rb`](api-health-check/) | Linux / macOS / Windows | Concurrent Net::HTTP endpoint health checker with retry/backoff and healthy/degraded/down reporting, no gems. |
 | [`scheduled-task-audit/scheduled_task_audit.rb`](scheduled-task-audit/) | Windows | Audits Task Scheduler via WIN32OLE/Schedule.Service for unquoted action paths, writable-directory hijacks, and privileged tasks in untrusted locations. |
+| [`proc-monitor/proc_monitor.rb`](proc-monitor/) | Linux | Lightweight process & resource monitor built on `/proc` — RSS, CPU%, state, and liveness checks with WARN/CRIT thresholds and cron-friendly exit codes. |
+| [`disk-usage-report/disk_usage_report.rb`](disk-usage-report/) | Linux / macOS | Walks a directory tree to find the biggest space consumers, flags stale cleanup candidates by age/pattern, and threshold-checks `df` output for paging. |
+| [`powershell-bridge/powershell_bridge.rb`](powershell-bridge/) | Windows | Drives `powershell.exe` from Ruby via `Open3` + `ConvertTo-Json`, adding retry/timeout/error handling for service, disk, and event-log admin tasks. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
@@ -62,6 +65,14 @@ respectively). The scheduled task auditor's WIN32OLE integration could not be ru
 real Windows host in this environment; its risk-scoring logic (`evaluate_task`) is instead
 fully unit-tested with realistic WIN32OLE-shaped fixtures — see
 `scheduled-task-audit/scheduled_task_audit_test.rb`.
+
+The process monitor and disk usage reporter were both tested live in a Linux sandbox — the
+process monitor against real backgrounded processes (including a CPU-bound loop to trigger
+CRIT thresholds), and the disk usage reporter against a scratch directory tree with
+backdated/oversized files plus a real `df`-based threshold check. The PowerShell bridge's
+`Open3`/JSON-parsing/retry/timeout logic is fully unit-tested with a stub shell-runner
+feeding realistic `ConvertTo-Json`-shaped fixtures, since `powershell.exe` itself isn't
+available in this environment — see `powershell-bridge/powershell_bridge_test.rb`.
 
 ## License
 
