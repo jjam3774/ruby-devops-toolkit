@@ -21,6 +21,9 @@ in a few minutes and dropped straight onto a box.
 | [`proc-monitor/proc_monitor.rb`](proc-monitor/) | Linux | Lightweight process & resource monitor built on `/proc` — RSS, CPU%, state, and liveness checks with WARN/CRIT thresholds and cron-friendly exit codes. |
 | [`disk-usage-report/disk_usage_report.rb`](disk-usage-report/) | Linux / macOS | Walks a directory tree to find the biggest space consumers, flags stale cleanup candidates by age/pattern, and threshold-checks `df` output for paging. |
 | [`powershell-bridge/powershell_bridge.rb`](powershell-bridge/) | Windows | Drives `powershell.exe` from Ruby via `Open3` + `ConvertTo-Json`, adding retry/timeout/error handling for service, disk, and event-log admin tasks. |
+| [`systemd-watchdog/systemd_watchdog.rb`](systemd-watchdog/) | Linux | Watches systemd units and classifies OK/WARN/CRIT, with optional rate-limited auto-restart for failed units. |
+| [`ssh-fleet-runner/ssh_fleet_runner.rb`](ssh-fleet-runner/) | Linux (control host) | Runs one command across a fleet of hosts over a bounded thread pool via the system `ssh` binary, with per-host timeout and retry. |
+| [`eventlog-monitor/eventlog_monitor.rb`](eventlog-monitor/) | Windows | Polls the Windows Event Log via WMI for new Error/Warning/Audit-Failure events since the last run, with persisted state between runs. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
