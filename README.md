@@ -24,6 +24,9 @@ in a few minutes and dropped straight onto a box.
 | [`systemd-watchdog/systemd_watchdog.rb`](systemd-watchdog/) | Linux | Watches systemd units and classifies OK/WARN/CRIT, with optional rate-limited auto-restart for failed units. |
 | [`ssh-fleet-runner/ssh_fleet_runner.rb`](ssh-fleet-runner/) | Linux (control host) | Runs one command across a fleet of hosts over a bounded thread pool via the system `ssh` binary, with per-host timeout and retry. |
 | [`eventlog-monitor/eventlog_monitor.rb`](eventlog-monitor/) | Windows | Polls the Windows Event Log via WMI for new Error/Warning/Audit-Failure events since the last run, with persisted state between runs. |
+| [`dns-resolver-checker/dns_resolver_checker.rb`](dns-resolver-checker/) | Linux / macOS / Windows | Cross-checks DNS records across multiple resolvers concurrently and flags drift, missing records, and resolver failures. |
+| [`sudoers-audit/sudoers_audit.rb`](sudoers-audit/) | Linux | Parses /etc/sudoers (including #include/#includedir) and flags privilege-escalation risks like NOPASSWD wildcards and ALL=(ALL) grants. |
+| [`winpolicy-audit/winpolicy_audit.rb`](winpolicy-audit/) | Windows | Audits Windows password and account lockout policy via `net accounts` against a configurable security baseline. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
