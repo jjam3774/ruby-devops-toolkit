@@ -27,6 +27,9 @@ in a few minutes and dropped straight onto a box.
 | [`dns-resolver-checker/dns_resolver_checker.rb`](dns-resolver-checker/) | Linux / macOS / Windows | Cross-checks DNS records across multiple resolvers concurrently and flags drift, missing records, and resolver failures. |
 | [`sudoers-audit/sudoers_audit.rb`](sudoers-audit/) | Linux | Parses /etc/sudoers (including #include/#includedir) and flags privilege-escalation risks like NOPASSWD wildcards and ALL=(ALL) grants. |
 | [`winpolicy-audit/winpolicy_audit.rb`](winpolicy-audit/) | Windows | Audits Windows password and account lockout policy via `net accounts` against a configurable security baseline. |
+| [`firewall-drift-audit/firewall_drift_audit.rb`](firewall-drift-audit/) | Linux | Parses `iptables-save` output and flags drift against a JSON baseline — default policies flipped to ACCEPT, ports opened wider than allowed, and baseline ports that quietly disappeared. |
+| [`docker-health-audit/docker_health_audit.rb`](docker-health-audit/) | Linux (Docker host) | Talks directly to the Docker Engine API over its Unix socket or TCP to flag crash-looping containers, `--privileged` containers, and containers that bind-mount the Docker socket. |
+| [`repo-governance-audit/repo_governance_audit.rb`](repo-governance-audit/) | Cross-platform (GitHub REST API) | Audits GitHub repos for missing branch protection, allowed force-pushes, unenforced PR review, and disabled Dependabot vulnerability alerts. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
@@ -79,6 +82,15 @@ backdated/oversized files plus a real `df`-based threshold check. The PowerShell
 `Open3`/JSON-parsing/retry/timeout logic is fully unit-tested with a stub shell-runner
 feeding realistic `ConvertTo-Json`-shaped fixtures, since `powershell.exe` itself isn't
 available in this environment — see `powershell-bridge/powershell_bridge_test.rb`.
+
+The firewall drift auditor and repo governance auditor were both verified against hand-built
+fixtures in a Linux sandbox with no root and no network access to `api.github.com` — the
+firewall auditor against two hand-built `iptables-save` snapshots (compliant and deliberately
+drifted), and the governance auditor against a local WEBrick stub implementing the three
+GitHub REST endpoints it depends on. The Docker health auditor's dual transport (Unix-socket
+and TCP) was exercised against two local stub servers serving the same four-container
+fixture set, since no real Docker daemon was available. See each script's README for the
+specifics.
 
 ## License
 
