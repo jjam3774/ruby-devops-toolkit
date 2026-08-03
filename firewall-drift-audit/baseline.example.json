@@ -1,0 +1,5 @@
+{
+  "default_policies": { "INPUT": "DROP", "FORWARD": "DROP", "OUTPUT": "ACCEPT" },
+  "allowed_tcp_ports": [22, 80, 443],
+  "allowed_udp_ports": [53]
+}
