@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Stub crontab(1) for testing: emulates -l (read) and - (write from stdin)
+# against a plain file instead of the real system crontab store.
+STORE="/sessions/zen-sharp-cray/mnt/outputs/work/cron-job-manager/test/fake_crontab_store.txt"
+if [ "$1" = "-l" ]; then
+  if [ -s "$STORE" ]; then
+    cat "$STORE"
+    exit 0
+  else
+    echo "no crontab for testuser" >&2
+    exit 1
+  fi
+elif [ "$1" = "-" ]; then
+  cat > "$STORE"
+  exit 0
+else
+  echo "unsupported args: $*" >&2
+  exit 1
+fi
