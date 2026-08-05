@@ -33,6 +33,9 @@ in a few minutes and dropped straight onto a box.
 | [`cert-expiry-monitor/cert_expiry_monitor.rb`](cert-expiry-monitor/) | Linux / macOS / Windows | Concurrent, dependency-free TLS certificate expiry monitor -- connects to a live host:port and checks the leaf certificate the server actually presents. |
 | [`cron-job-manager/cron_job_manager.rb`](cron-job-manager/) | Linux / macOS | Safely adds, updates, and removes tagged crontab entries with schedule validation, leaving unrelated entries untouched. |
 | [`windows-update-audit/windows_update_audit.rb`](windows-update-audit/) | Windows | Audits Windows Update compliance via the Update Agent COM API and WMI -- pending-update severity, reboot state, and patch staleness. |
+| [`log-rotate-manager/log_rotate.rb`](log-rotate-manager/) | Linux / macOS / Windows | Dependency-free reimplementation of logrotate's core mechanics -- size/age-triggered rotation, gzip compression, retention enforcement, and post-rotate hooks via the copytruncate strategy. |
+| [`windows-firewall-audit/win_firewall_audit.rb`](windows-firewall-audit/) | Windows | Audits Windows Defender Firewall rules via WMI (`MSFT_NetFirewallRule`) for inbound-allow-any-any exposure on the Public profile and `EdgeTraversalPolicy=Allow` NAT bypasses. |
+| [`ssh-key-audit/ssh_key_audit.rb`](ssh-key-audit/) | Linux / macOS | Parses `authorized_keys` files against the real sshd wire format to flag weak/DSA keys, unrestricted service accounts, bad permissions, and keys shared across multiple accounts. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
@@ -94,6 +97,13 @@ GitHub REST endpoints it depends on. The Docker health auditor's dual transport 
 and TCP) was exercised against two local stub servers serving the same four-container
 fixture set, since no real Docker daemon was available. See each script's README for the
 specifics.
+
+The log rotate manager and SSH key auditor were both tested live in a Linux sandbox against
+real files and real `ssh-keygen`-generated fixtures respectively. The Windows firewall
+auditor's WMI integration could not be run against a real Windows host in this environment;
+its join logic (`RuleBuilder`) and risk engine (`evaluate_rule`) are instead fully
+unit-tested with realistic WIN32OLE-shaped fixtures — see
+`windows-firewall-audit/win_firewall_audit_test.rb`.
 
 ## License
 
