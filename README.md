@@ -36,6 +36,9 @@ in a few minutes and dropped straight onto a box.
 | [`log-rotate-manager/log_rotate.rb`](log-rotate-manager/) | Linux / macOS / Windows | Dependency-free reimplementation of logrotate's core mechanics -- size/age-triggered rotation, gzip compression, retention enforcement, and post-rotate hooks via the copytruncate strategy. |
 | [`windows-firewall-audit/win_firewall_audit.rb`](windows-firewall-audit/) | Windows | Audits Windows Defender Firewall rules via WMI (`MSFT_NetFirewallRule`) for inbound-allow-any-any exposure on the Public profile and `EdgeTraversalPolicy=Allow` NAT bypasses. |
 | [`ssh-key-audit/ssh_key_audit.rb`](ssh-key-audit/) | Linux / macOS | Parses `authorized_keys` files against the real sshd wire format to flag weak/DSA keys, unrestricted service accounts, bad permissions, and keys shared across multiple accounts. |
+| [`backup-verify/backup_verify.rb`](backup-verify/) | Linux / macOS | Creates a tar.gz backup and restore-tests it in the same run by extracting into a scratch dir and diffing SHA-256 hashes, so a corrupt backup fails loudly instead of silently. |
+| [`file-integrity-monitor/file_integrity_monitor.rb`](file-integrity-monitor/) | Linux / macOS | Baselines SHA-256 + size + mtime + permission bits for watched paths and diffs on demand, reporting added/removed/content-changed/permissions-changed files — cron-friendly, no daemon. |
+| [`local-admin-audit/local_admin_audit.rb`](local-admin-audit/) | Windows | Audits local Administrators group membership across a host fleet via WMI against a YAML allow-list, flagging unauthorized and missing members; ships with a stub-based test harness. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
