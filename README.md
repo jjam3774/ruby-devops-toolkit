@@ -39,6 +39,9 @@ in a few minutes and dropped straight onto a box.
 | [`backup-verify/backup_verify.rb`](backup-verify/) | Linux / macOS | Creates a tar.gz backup and restore-tests it in the same run by extracting into a scratch dir and diffing SHA-256 hashes, so a corrupt backup fails loudly instead of silently. |
 | [`file-integrity-monitor/file_integrity_monitor.rb`](file-integrity-monitor/) | Linux / macOS | Baselines SHA-256 + size + mtime + permission bits for watched paths and diffs on demand, reporting added/removed/content-changed/permissions-changed files — cron-friendly, no daemon. |
 | [`local-admin-audit/local_admin_audit.rb`](local-admin-audit/) | Windows | Audits local Administrators group membership across a host fleet via WMI against a YAML allow-list, flagging unauthorized and missing members; ships with a stub-based test harness. |
+| [`alert-notifier/alert_notifier.rb`](alert-notifier/) | Linux / macOS / Windows | De-duplicated, rate-limited Slack/webhook alerting with automatic retry/backoff, usable as a CLI or a library. |
+| [`winservice-manager/winservice_manager.rb`](winservice-manager/) | Windows | Declarative Windows service reconciliation via WMI: brings running state and startup type in line with a YAML spec. |
+| [`git-branch-hygiene/git_branch_hygiene.rb`](git-branch-hygiene/) | Linux / macOS / Windows | Audits and safely prunes stale or merged local git branches across a fleet of repos, with a force-confirm safety rail. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
