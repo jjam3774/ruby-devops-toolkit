@@ -42,6 +42,9 @@ in a few minutes and dropped straight onto a box.
 | [`alert-notifier/alert_notifier.rb`](alert-notifier/) | Linux / macOS / Windows | De-duplicated, rate-limited Slack/webhook alerting with automatic retry/backoff, usable as a CLI or a library. |
 | [`winservice-manager/winservice_manager.rb`](winservice-manager/) | Windows | Declarative Windows service reconciliation via WMI: brings running state and startup type in line with a YAML spec. |
 | [`git-branch-hygiene/git_branch_hygiene.rb`](git-branch-hygiene/) | Linux / macOS / Windows | Audits and safely prunes stale or merged local git branches across a fleet of repos, with a force-confirm safety rail. |
+| [`cert-store-audit/cert_store_audit.rb`](cert-store-audit/) | Linux / macOS / Windows | Audits certificate and private-key files on disk (not just what a server presents live) for expiry, weak RSA keys, self-signed certs, world-readable keys, and cert/key mismatches. |
+| [`mem-pressure-monitor/mem_pressure_monitor.rb`](mem-pressure-monitor/) | Linux | Reports real memory pressure from `/proc/meminfo`, swap, kernel PSI, and OOM-killer log scanning -- not just "percent used." |
+| [`ntfs-acl-audit/ntfs_acl_audit.rb`](ntfs-acl-audit/) | Windows | Audits NTFS folder/file permissions via `icacls.exe` and flags grants of Modify/Write/FullControl to broad identities like `Everyone`. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
@@ -110,6 +113,18 @@ auditor's WMI integration could not be run against a real Windows host in this e
 its join logic (`RuleBuilder`) and risk engine (`evaluate_rule`) are instead fully
 unit-tested with realistic WIN32OLE-shaped fixtures — see
 `windows-firewall-audit/win_firewall_audit_test.rb`.
+
+The certificate store auditor and memory pressure monitor were both tested live in a Linux
+sandbox against real fixtures — the cert/key auditor against `openssl`-generated certs and
+keys covering all six code paths (healthy, expiring, expired, weak key, mismatched pair,
+world-readable key), and the memory pressure monitor against the sandbox's real
+`/proc/meminfo`/`/proc/pressure/memory` plus hand-built fixture files (via the
+`--meminfo-path`/`--psi-path` overrides) to exercise the WARN/CRIT and swap-pressure code
+paths deterministically. The NTFS ACL auditor depends on Windows-only `icacls.exe`, which
+wasn't available in this environment; its parsing (`parse_icacls_output`) and risk-evaluation
+(`evaluate_ace`) logic is instead fully unit-tested with an injectable `runner:` feeding
+realistic `icacls` output — see `ntfs-acl-audit/ntfs_acl_audit_test.rb` (11 tests, all
+passing).
 
 ## License
 
