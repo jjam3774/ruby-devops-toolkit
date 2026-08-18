@@ -1,0 +1,102 @@
+name: baseline-linux-server-v1
+
+checks:
+  - key: net.ipv4.ip_forward
+    op: eq
+    value: 0
+    severity: high
+    title: IP forwarding disabled
+    rationale: a non-router host that forwards packets can be used to pivot between networks
+
+  - key: net.ipv4.conf.all.accept_redirects
+    op: eq
+    value: 0
+    severity: high
+    title: ICMP redirects rejected
+    rationale: accepting redirects lets an attacker on the LAN reroute your traffic
+
+  - key: net.ipv4.conf.all.accept_source_route
+    op: eq
+    value: 0
+    severity: high
+    title: Source-routed packets dropped
+    rationale: source routing lets a sender pick the return path and bypass filtering
+
+  - key: net.ipv4.conf.all.rp_filter
+    op: in
+    value: [1, 2]
+    severity: medium
+    title: Reverse path filtering enabled
+    rationale: drops packets whose source address could not have arrived on that interface
+
+  - key: net.ipv4.tcp_syncookies
+    op: eq
+    value: 1
+    severity: medium
+    title: TCP SYN cookies enabled
+    rationale: keeps the listen queue usable during a SYN flood
+
+  - key: net.ipv4.conf.all.log_martians
+    op: eq
+    value: 1
+    severity: low
+    title: Martian packets logged
+    rationale: gives you evidence of spoofing attempts in the kernel log
+
+  - key: kernel.randomize_va_space
+    op: eq
+    value: 2
+    severity: critical
+    title: Full ASLR enabled
+    rationale: full address space randomisation is the cheapest exploit mitigation there is
+
+  - key: kernel.dmesg_restrict
+    op: eq
+    value: 1
+    severity: medium
+    title: dmesg restricted to privileged users
+    rationale: the kernel ring buffer leaks addresses and hardware detail useful to an attacker
+
+  - key: kernel.kptr_restrict
+    op: gte
+    value: 1
+    severity: medium
+    title: Kernel pointers hidden
+    rationale: exposed kernel pointers defeat KASLR
+
+  - key: fs.suid_dumpable
+    op: eq
+    value: 0
+    severity: high
+    title: setuid core dumps disabled
+    rationale: a core dump from a setuid binary can contain secrets readable by the caller
+
+  - key: fs.protected_hardlinks
+    op: eq
+    value: 1
+    severity: medium
+    title: Hardlink protection enabled
+    rationale: blocks a classic /tmp symlink-and-hardlink privilege escalation
+
+  - key: fs.protected_symlinks
+    op: eq
+    value: 1
+    severity: medium
+    title: Symlink protection enabled
+    rationale: blocks following symlinks in world-writable sticky directories
+
+  - key: net.ipv6.conf.all.accept_redirects
+    op: eq
+    value: 0
+    severity: medium
+    title: IPv6 ICMP redirects rejected
+    rationale: same pivot risk as IPv4 redirects
+    skip_if_absent: true
+
+  - key: kernel.unprivileged_bpf_disabled
+    op: gte
+    value: 1
+    severity: high
+    title: Unprivileged BPF disabled
+    rationale: unprivileged BPF has been a repeat source of local privilege escalation
+    skip_if_absent: true
