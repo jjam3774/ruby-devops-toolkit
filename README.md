@@ -45,6 +45,9 @@ in a few minutes and dropped straight onto a box.
 | [`cert-store-audit/cert_store_audit.rb`](cert-store-audit/) | Linux / macOS / Windows | Audits certificate and private-key files on disk (not just what a server presents live) for expiry, weak RSA keys, self-signed certs, world-readable keys, and cert/key mismatches. |
 | [`mem-pressure-monitor/mem_pressure_monitor.rb`](mem-pressure-monitor/) | Linux | Reports real memory pressure from `/proc/meminfo`, swap, kernel PSI, and OOM-killer log scanning -- not just "percent used." |
 | [`ntfs-acl-audit/ntfs_acl_audit.rb`](ntfs-acl-audit/) | Windows | Audits NTFS folder/file permissions via `icacls.exe` and flags grants of Modify/Write/FullControl to broad identities like `Everyone`. |
+| [`listening-port-audit/port_audit.rb`](listening-port-audit/) | Linux | Compares every listening TCP/UDP socket against a YAML baseline, flagging unauthorised listeners and services bound world-wide that should be loopback-only. Falls back to parsing `/proc/net` when `ss` is absent. |
+| [`sysctl-hardening-audit/sysctl_audit.rb`](sysctl-hardening-audit/) | Linux | Audits kernel parameters straight from `/proc/sys` against a declarative hardening policy, produces a severity-weighted score, and writes a reviewable `/etc/sysctl.d/` drop-in containing only the fixes needed. |
+| [`smb-share-audit/smb_share_audit.rb`](smb-share-audit/) | Windows | Enumerates SMB shares via WMI and decodes the share-level DACL, flagging broad trustees with write/full control, drive-root shares, and dangling share definitions. Includes a fixture-based `--self-test` that runs off-Windows. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
