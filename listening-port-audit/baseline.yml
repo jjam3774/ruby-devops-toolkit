@@ -1,0 +1,37 @@
+# baseline.yml -- what this class of host is allowed to listen on.
+# Commit this next to your config management so drift shows up in code review.
+
+# Ports we never want to hear about (build agents, sidecar proxies, etc).
+ignore_ports: [1080, 3128]
+
+allowed:
+  - port: 22
+    proto: tcp
+    scope: any
+    process: sshd
+    required: true
+    note: fleet SSH access
+
+  - port: 3000
+    proto: tcp
+    scope: any
+    required: true
+    note: application server behind the load balancer
+
+  - port: 5432
+    proto: tcp
+    scope: loopback
+    required: false
+    note: postgres -- must never leave the box
+
+  - port: 6379
+    proto: tcp
+    scope: loopback
+    required: false
+    note: redis -- no auth configured, loopback only
+
+  - port: 9100
+    proto: tcp
+    scope: any
+    required: false
+    note: node_exporter scraped by prometheus
