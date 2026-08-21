@@ -1,482 +1,218 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #
-# disk_usage_report.rb
+# disk_usage_report.rb — disk usage reporting with snapshot diffing.
 #
-# A pure stdlib (Ruby 3.0+) disk-usage reporting and cleanup-candidate tool.
+# Walks one or more directory trees, reports the largest subdirectories and
+# files, checks filesystem fullness against warn/crit thresholds, and —
+# the part `du` won't do for you — persists a JSON snapshot each run so the
+# NEXT run can tell you what actually GREW since last time. Finding out that
+# /var/log is 40 GB is useful once; finding out it grew 6 GB overnight is
+# useful every day.
 #
-# WHAT IT DOES
-#   1. Walks one or more directory trees and aggregates disk usage per
-#      top-level subdirectory, plus finds the N largest individual files.
-#   2. Flags files older than a configurable age that match "cleanup"
-#      glob patterns (logs, tmp files, core dumps, etc.) and reports how
-#      much space could be reclaimed.
-#   3. Optionally deletes those flagged files -- but ONLY when you pass
-#      --delete explicitly. The default is always a safe, read-only
-#      --dry-run.
-#   4. Runs a filesystem-level threshold check (like a Nagios/monitoring
-#      plugin) by shelling out to `df` and parsing its output, returning
-#      cron/monitoring-friendly exit codes: 0=OK, 1=WARN, 2=CRIT, 3=UNKNOWN.
-#   5. Emits either human-readable text or --json, matching the rest of
-#      this toolkit's convention of "text/JSON on every script, cron-
-#      friendly exit codes."
+# Usage:
+#   ruby disk_usage_report.rb [options] DIR [DIR ...]
 #
-# WHY `df` VIA Open3 INSTEAD OF A GEM
-#   There is no filesystem-statistics call in Ruby's stdlib (no `statvfs`
-#   wrapper, no `Sys::Filesystem`). The two realistic options are:
-#     a) add the `sys-filesystem` gem, or
-#     b) shell out to the `df` utility, which exists on every Linux/macOS
-#        box by definition and prints exactly the numbers we need.
-#   Since this toolkit is pure-stdlib-only, we shell out to `df -Pk` via
-#   Open3.capture3 (POSIX output format -- stable column layout across
-#   Linux and macOS/BSD) and parse the result. Open3 is used (rather than
-#   backticks or `system`) so we get separate stdout/stderr streams and a
-#   real Process::Status we can check, without invoking a shell.
+#   -n, --top N            show top N entries per section (default 10)
+#   -d, --depth N          aggregate directory sizes at depth N below each
+#                          root (default 1: immediate children)
+#   -s, --snapshot FILE    read previous snapshot from FILE (if it exists),
+#                          diff against it, then overwrite it with this run
+#   -w, --warn PCT         WARN when a filesystem is >= PCT% full (default 80)
+#   -c, --crit PCT         CRIT when a filesystem is >= PCT% full (default 90)
+#   -g, --growth-warn MB   WARN when a directory grew >= MB since snapshot
+#                          (default 512)
+#   -j, --json             emit JSON instead of text
+#   -x, --one-file-system  don't cross filesystem boundaries while walking
 #
-# SAFETY MODEL
-#   - Default mode is --dry-run: the script only ever *reports* what it
-#     would delete and how much space would be reclaimed.
-#   - --delete is required to actually remove anything, and even then:
-#       * only files that are BOTH older than --older-than-days AND match
-#         one of --pattern's globs are eligible ("belt and suspenders" --
-#         age alone or pattern alone is not enough).
-#       * symlinks are never followed or deleted (File.symlink? check).
-#       * a bare `--pattern '*'` (matches everything) is rejected unless
-#         --force-wildcard is also given, to stop a fat-fingered "delete
-#         everything old" run.
-#       * every deletion (and every deletion failure) is logged.
-#   - Permission errors on individual files/dirs are caught and reported
-#     as skipped entries; the script never aborts the whole run because
-#     of one unreadable file.
+# Exit codes: 0 = OK, 1 = WARN, 2 = CRIT. Cron/Nagios friendly.
+#
+# Stdlib only — no gems. Tested on Ruby 3.0+.
 
-require 'find'
 require 'optparse'
 require 'json'
-require 'open3'
-require 'time'
+require 'find'
 
 # ---------------------------------------------------------------------------
-# Option parsing
+# Options
 # ---------------------------------------------------------------------------
+options = {
+  top: 10, depth: 1, snapshot: nil,
+  warn_pct: 80, crit_pct: 90, growth_warn_mb: 512,
+  json: false, one_fs: false
+}
 
-Options = Struct.new(
-  :paths, :top_n, :older_than_days, :patterns, :dry_run, :force_wildcard,
-  :json, :warn_pct, :crit_pct, :df_paths, :skip_threshold, :quiet_skips,
-  keyword_init: true
-)
+OptionParser.new do |o|
+  o.banner = 'Usage: ruby disk_usage_report.rb [options] DIR [DIR ...]'
+  o.on('-n', '--top N', Integer)            { |v| options[:top] = v }
+  o.on('-d', '--depth N', Integer)          { |v| options[:depth] = v }
+  o.on('-s', '--snapshot FILE', String)     { |v| options[:snapshot] = v }
+  o.on('-w', '--warn PCT', Integer)         { |v| options[:warn_pct] = v }
+  o.on('-c', '--crit PCT', Integer)         { |v| options[:crit_pct] = v }
+  o.on('-g', '--growth-warn MB', Integer)   { |v| options[:growth_warn_mb] = v }
+  o.on('-j', '--json')                      { options[:json] = true }
+  o.on('-x', '--one-file-system')           { options[:one_fs] = true }
+end.parse!
 
-def parse_options(argv)
-  opts = Options.new(
-    paths: [],
-    top_n: 15,
-    older_than_days: 30,
-    patterns: ['*.log', '*.tmp', 'core.*', '*.core', '*~'],
-    dry_run: true,
-    force_wildcard: false,
-    json: false,
-    warn_pct: 80,
-    crit_pct: 90,
-    df_paths: [],
-    skip_threshold: false,
-    quiet_skips: false
-  )
+roots = ARGV.map { |a| File.expand_path(a) }
+abort 'error: give me at least one directory to scan' if roots.empty?
+roots.each { |r| abort "error: not a directory: #{r}" unless File.directory?(r) }
 
-  parser = OptionParser.new do |o|
-    o.banner = "Usage: disk_usage_report.rb [options] PATH [PATH ...]"
-
-    o.on('-nN', '--top-n=N', Integer, 'Number of largest files to report (default 15)') do |v|
-      opts.top_n = v
-    end
-
-    o.on('--older-than-days=N', Integer,
-         'Age threshold in days for cleanup candidates (default 30)') do |v|
-      opts.older_than_days = v
-    end
-
-    o.on('--pattern=LIST', Array,
-         "Comma-separated glob patterns for cleanup candidates\n" \
-         "                                     (default: *.log,*.tmp,core.*,*.core,*~)") do |v|
-      opts.patterns = v
-    end
-
-    o.on('--dry-run', 'Report only, delete nothing (default)') do
-      opts.dry_run = true
-    end
-
-    o.on('--delete', 'Actually delete flagged cleanup candidates (explicit opt-in)') do
-      opts.dry_run = false
-    end
-
-    o.on('--force-wildcard', 'Allow a bare "*" cleanup pattern with --delete') do
-      opts.force_wildcard = true
-    end
-
-    o.on('--json', 'Emit machine-readable JSON instead of text') do
-      opts.json = true
-    end
-
-    o.on('--warn-pct=N', Integer, 'Filesystem use% that triggers WARN (default 80)') do |v|
-      opts.warn_pct = v
-    end
-
-    o.on('--crit-pct=N', Integer, 'Filesystem use% that triggers CRIT (default 90)') do |v|
-      opts.crit_pct = v
-    end
-
-    o.on('--df-path=PATH', 'Filesystem (mount point or any path on it) to threshold-check.',
-         'Repeatable. Defaults to the scanned PATH(s) if omitted.') do |v|
-      opts.df_paths << v
-    end
-
-    o.on('--skip-threshold', 'Skip the df threshold check entirely') do
-      opts.skip_threshold = true
-    end
-
-    o.on('-q', '--quiet-skips', 'Do not list individual permission-denied skips') do
-      opts.quiet_skips = true
-    end
-
-    o.on('-h', '--help', 'Show this help') do
-      puts o
-      exit 0
-    end
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def human(bytes)
+  units = %w[B KiB MiB GiB TiB]
+  size  = bytes.to_f
+  unit  = 0
+  while size >= 1024 && unit < units.size - 1
+    size /= 1024
+    unit += 1
   end
+  format(unit.zero? ? '%d %s' : '%.1f %s', size, units[unit])
+end
 
-  opts.paths = parser.parse(argv)
-  opts.paths = ['.'] if opts.paths.empty?
-  opts.df_paths = opts.paths.dup if opts.df_paths.empty?
+# Aggregation bucket for a path: which depth-N ancestor a file belongs to.
+def bucket_for(path, root, depth)
+  rel = path[(root.length + 1)..]
+  return root if rel.nil? || rel.empty?
 
-  if !opts.dry_run && opts.patterns.include?('*') && !opts.force_wildcard
-    warn "refusing to --delete with a bare '*' pattern (would match everything)."
-    warn "pass --force-wildcard if you really mean it."
-    exit 3
-  end
+  parts = rel.split(File::SEPARATOR)
+  return root if parts.length <= depth && !File.directory?(path)
 
-  opts
+  File.join(root, parts.first(depth))
 end
 
 # ---------------------------------------------------------------------------
-# Tree walk + aggregation
+# Walk the trees
 # ---------------------------------------------------------------------------
+dir_sizes   = Hash.new(0)          # bucket path  -> bytes
+big_files   = []                   # [bytes, path] min-heap-ish (we sort later)
+errors      = 0
+file_count  = 0
 
-# One record per file we successfully stat'd.
-FileRecord = Struct.new(:path, :size, :mtime, :top_dir)
-
-# Walks `root` with Find, yielding a FileRecord for every regular file and
-# accumulating permission/stat errors into `skipped` instead of raising.
-def walk(root, skipped)
-  records = []
-  root = File.expand_path(root)
-
-  unless File.exist?(root)
-    skipped << { path: root, error: 'no such file or directory' }
-    return records
-  end
-
+roots.each do |root|
+  root_dev = File.lstat(root).dev
   Find.find(root) do |path|
     begin
-      stat = File.lstat(path) # lstat: never follow symlinks into the void
-      if stat.symlink?
-        Find.prune if stat.directory? # don't descend into symlinked dirs
-        next
-      end
-
-      if stat.directory?
-        # Find.find already recurses; nothing to record for the dir itself,
-        # but we do want to skip directories we can't read at all.
-        begin
-          Dir.entries(path)
-        rescue Errno::EACCES, Errno::EPERM => e
-          skipped << { path: path, error: e.message }
-          Find.prune
-        end
-        next
-      end
-
-      next unless stat.file?
-
-      top_dir = top_level_subdir(root, path)
-      records << FileRecord.new(path, stat.size, stat.mtime, top_dir)
-    rescue Errno::ENOENT
-      # File vanished between Find yielding it and us stat'ing it -- ignore.
-      next
-    rescue Errno::EACCES, Errno::EPERM => e
-      skipped << { path: path, error: e.message }
+      st = File.lstat(path)
+    rescue SystemCallError
+      errors += 1
       next
     end
-  end
 
-  records
+    # Optionally refuse to wander onto other mounts (/proc, NFS, ...).
+    if st.directory? && options[:one_fs] && st.dev != root_dev
+      Find.prune
+      next
+    end
+
+    next unless st.file?
+
+    file_count += 1
+    dir_sizes[bucket_for(path, root, options[:depth])] += st.size
+    big_files << [st.size, path]
+    # Keep the candidate list small; no need to hold every file in RAM.
+    big_files = big_files.max_by(options[:top] * 4) { |s, _| s } if big_files.size > options[:top] * 8
+  end
 end
 
-# Maps an absolute file path back to the first path segment under `root`,
-# e.g. root=/var/log, path=/var/log/nginx/access.log -> "nginx"
-# Files directly inside root are bucketed under "." (root itself).
-def top_level_subdir(root, path)
-  rel = path.delete_prefix(root).delete_prefix(File::SEPARATOR)
-  first = rel.split(File::SEPARATOR).first
-  first.nil? || first == File.basename(path) ? '.' : first
-end
+top_dirs  = dir_sizes.sort_by { |_, v| -v }.first(options[:top])
+top_files = big_files.max_by(options[:top]) { |s, _| s }
+              .sort_by { |s, _| -s }
 
-def human_bytes(n)
-  units = %w[B KB MB GB TB PB]
-  size = n.to_f
-  idx = 0
-  while size >= 1024 && idx < units.length - 1
-    size /= 1024
-    idx += 1
-  end
-  idx.zero? ? "#{n} #{units[idx]}" : format('%.2f %s', size, units[idx])
+# ---------------------------------------------------------------------------
+# Filesystem fullness via `df` (POSIX -P output is stable and parseable)
+# ---------------------------------------------------------------------------
+fs_alerts = []
+filesystems = []
+roots.uniq.each do |root|
+  out = `df -kP #{root} 2>/dev/null`.lines
+  next if out.length < 2
+
+  cols = out[1].split
+  next if cols.length < 6
+
+  pct = cols[4].delete('%').to_i
+  fs  = { mount: cols[5], size_kb: cols[1].to_i, used_kb: cols[2].to_i, used_pct: pct }
+  next if filesystems.any? { |f| f[:mount] == fs[:mount] }
+
+  filesystems << fs
+  level = pct >= options[:crit_pct] ? 'CRIT' : (pct >= options[:warn_pct] ? 'WARN' : nil)
+  fs_alerts << { level: level, mount: fs[:mount], used_pct: pct } if level
 end
 
 # ---------------------------------------------------------------------------
-# Cleanup candidate detection
+# Snapshot diffing: what grew since last run?
 # ---------------------------------------------------------------------------
-
-def cleanup_candidate?(record, cutoff_time, patterns)
-  return false unless record.mtime < cutoff_time
-
-  base = File.basename(record.path)
-  patterns.any? { |glob| File.fnmatch(glob, base, File::FNM_EXTGLOB) }
-end
-
-# Deletes flagged records for real. Returns [deleted, failed] arrays.
-def delete_candidates(candidates)
-  deleted = []
-  failed = []
-  candidates.each do |rec|
+growth = []
+if options[:snapshot]
+  previous = {}
+  if File.exist?(options[:snapshot])
     begin
-      # Re-check symlink-ness right before unlinking (TOCTOU hardening).
-      if File.symlink?(rec.path)
-        failed << { path: rec.path, error: 'refusing to delete a symlink' }
-        next
-      end
-      File.delete(rec.path)
-      deleted << rec
-    rescue Errno::ENOENT
-      # Already gone -- treat as success, nothing left to reclaim.
-      deleted << rec
-    rescue Errno::EACCES, Errno::EPERM => e
-      failed << { path: rec.path, error: e.message }
+      previous = JSON.parse(File.read(options[:snapshot]))['dirs'] || {}
+    rescue JSON::ParserError
+      warn "warning: snapshot #{options[:snapshot]} is corrupt, ignoring"
     end
   end
-  [deleted, failed]
+
+  dir_sizes.each do |path, bytes|
+    delta = bytes - (previous[path] || 0)
+    growth << { path: path, bytes: bytes, delta: delta } if delta.abs > 0 && previous.key?(path)
+  end
+  growth.sort_by! { |g| -g[:delta] }
+
+  # Persist this run for next time (write-then-rename would be even safer).
+  File.write(options[:snapshot],
+             JSON.pretty_generate(scanned_at: Time.now.to_s, dirs: dir_sizes))
 end
 
+growth_alerts = growth.select { |g| g[:delta] >= options[:growth_warn_mb] * 1024 * 1024 }
+
 # ---------------------------------------------------------------------------
-# `df`-based filesystem threshold check
+# Verdict + output
 # ---------------------------------------------------------------------------
+exit_code = 0
+exit_code = 1 if fs_alerts.any? { |a| a[:level] == 'WARN' } || growth_alerts.any?
+exit_code = 2 if fs_alerts.any? { |a| a[:level] == 'CRIT' }
 
-DfResult = Struct.new(:target, :filesystem, :mount, :use_pct, :status, :error, keyword_init: true)
+if options[:json]
+  puts JSON.pretty_generate(
+    scanned_roots: roots, files_seen: file_count, walk_errors: errors,
+    filesystems: filesystems,
+    top_dirs: top_dirs.map  { |p, b| { path: p, bytes: b } },
+    top_files: top_files.map { |b, p| { path: p, bytes: b } },
+    growth: growth.first(options[:top]),
+    alerts: fs_alerts + growth_alerts.map { |g| { level: 'WARN', path: g[:path], grew: g[:delta] } },
+    exit_code: exit_code
+  )
+else
+  puts "disk_usage_report — #{Time.now.strftime('%Y-%m-%d %H:%M:%S')}"
+  puts "scanned #{roots.join(', ')} (#{file_count} files, #{errors} unreadable)"
+  puts
 
-STATUS_OK   = 'OK'
-STATUS_WARN = 'WARN'
-STATUS_CRIT = 'CRIT'
-STATUS_UNKNOWN = 'UNKNOWN'
-
-EXIT_CODES = { STATUS_OK => 0, STATUS_WARN => 1, STATUS_CRIT => 2, STATUS_UNKNOWN => 3 }.freeze
-
-# Shells out to `df -Pk <path>` (POSIX output, 1024-byte blocks -- a stable
-# format on both GNU/Linux and macOS/BSD) and parses the single data line.
-# Using Open3.capture3 avoids a shell entirely (no injection risk from a
-# user-supplied path) and gives us stdout, stderr and exit status separately.
-def df_check(path, warn_pct, crit_pct)
-  stdout, stderr, status = Open3.capture3('df', '-Pk', path)
-
-  unless status.success?
-    return DfResult.new(target: path, status: STATUS_UNKNOWN,
-                         error: stderr.strip.empty? ? "df exited #{status.exitstatus}" : stderr.strip)
+  filesystems.each do |fs|
+    flag = fs[:used_pct] >= options[:crit_pct] ? ' [CRIT]' :
+           fs[:used_pct] >= options[:warn_pct] ? ' [WARN]' : ''
+    puts format('filesystem %-20s %3d%% full%s', fs[:mount], fs[:used_pct], flag)
   end
 
-  lines = stdout.lines.map(&:strip).reject(&:empty?)
-  # lines[0] is the header; the data line may wrap onto a second line if the
-  # filesystem name is long (common on Linux with long device paths), in
-  # which case df puts the remaining columns on the next line. Handle both.
-  data_lines = lines[1..] || []
-  fields = data_lines.join(' ').split(/\s+/)
+  puts "\ntop #{options[:top]} directories (depth #{options[:depth]}):"
+  top_dirs.each { |p, b| puts format('  %10s  %s', human(b), p) }
 
-  if fields.size < 6
-    return DfResult.new(target: path, status: STATUS_UNKNOWN, error: "unparseable df output: #{stdout.inspect}")
-  end
+  puts "\ntop #{options[:top]} files:"
+  top_files.each { |b, p| puts format('  %10s  %s', human(b), p) }
 
-  filesystem = fields[0]
-  use_pct_str = fields[4] # e.g. "83%"
-  mount = fields[5]
-  use_pct = use_pct_str.delete('%').to_i
-
-  status_label =
-    if use_pct >= crit_pct then STATUS_CRIT
-    elsif use_pct >= warn_pct then STATUS_WARN
-    else STATUS_OK
+  unless growth.empty?
+    puts "\ngrowth since last snapshot:"
+    growth.first(options[:top]).each do |g|
+      sign = g[:delta].positive? ? '+' : '-'
+      flag = g[:delta] >= options[:growth_warn_mb] * 1024 * 1024 ? ' [WARN]' : ''
+      puts format('  %s%9s  %s%s', sign, human(g[:delta].abs), g[:path], flag)
     end
+  end
 
-  DfResult.new(target: path, filesystem: filesystem, mount: mount,
-               use_pct: use_pct, status: status_label)
-rescue Errno::ENOENT
-  DfResult.new(target: path, status: STATUS_UNKNOWN, error: 'df: command not found')
+  puts "\nverdict: #{%w[OK WARN CRIT][exit_code]}"
 end
 
-def worst_status(results)
-  order = [STATUS_UNKNOWN, STATUS_CRIT, STATUS_WARN, STATUS_OK]
-  results.map(&:status).min_by { |s| order.index(s) } || STATUS_OK
-end
-
-# ---------------------------------------------------------------------------
-# Report assembly
-# ---------------------------------------------------------------------------
-
-def build_report(opts)
-  skipped = []
-  all_records = opts.paths.flat_map { |p| walk(p, skipped) }
-
-  per_root = opts.paths.each_with_object({}) do |root, h|
-    root_exp = File.expand_path(root)
-    recs = all_records.select { |r| r.path.start_with?(root_exp) }
-    totals = Hash.new(0)
-    counts = Hash.new(0)
-    recs.each do |r|
-      totals[r.top_dir] += r.size
-      counts[r.top_dir] += 1
-    end
-    h[root] = {
-      total_bytes: recs.sum(&:size),
-      file_count: recs.size,
-      subdirs: totals.map { |name, bytes| { name: name, bytes: bytes, files: counts[name] } }
-                      .sort_by { |h2| -h2[:bytes] }
-    }
-  end
-
-  largest_files = all_records.sort_by { |r| -r.size }.first(opts.top_n).map do |r|
-    { path: r.path, bytes: r.size, mtime: r.mtime.iso8601 }
-  end
-
-  cutoff = Time.now - (opts.older_than_days * 86_400)
-  candidates = all_records.select { |r| cleanup_candidate?(r, cutoff, opts.patterns) }
-  reclaimable_bytes = candidates.sum(&:size)
-
-  deleted, delete_failed = if !opts.dry_run && !candidates.empty?
-                             delete_candidates(candidates)
-                           else
-                             [[], []]
-                           end
-
-  threshold_results = opts.skip_threshold ? [] : opts.df_paths.map { |p| df_check(p, opts.warn_pct, opts.crit_pct) }
-
-  {
-    scanned_paths: opts.paths.map { |p| File.expand_path(p) },
-    generated_at: Time.now.iso8601,
-    dry_run: opts.dry_run,
-    per_root: per_root,
-    largest_files: largest_files,
-    cleanup: {
-      older_than_days: opts.older_than_days,
-      patterns: opts.patterns,
-      candidate_count: candidates.size,
-      reclaimable_bytes: reclaimable_bytes,
-      deleted_count: deleted.size,
-      deleted_bytes: deleted.sum(&:size),
-      delete_failed: delete_failed,
-      candidates: candidates.first(200).map { |r| { path: r.path, bytes: r.size, mtime: r.mtime.iso8601 } }
-    },
-    skipped: skipped,
-    threshold: threshold_results.map do |r|
-      { target: r.target, filesystem: r.filesystem, mount: r.mount,
-        use_pct: r.use_pct, status: r.status, error: r.error }
-    end
-  }
-end
-
-# ---------------------------------------------------------------------------
-# Output rendering
-# ---------------------------------------------------------------------------
-
-def render_text(report, opts)
-  out = +''
-  out << "disk_usage_report -- #{report[:generated_at]}\n"
-  out << "mode: #{opts.dry_run ? 'DRY-RUN (no files deleted)' : 'DELETE (files removed below)'}\n"
-  out << ("=" * 70) << "\n"
-
-  report[:per_root].each do |root, data|
-    out << "\nPATH: #{File.expand_path(root)}\n"
-    out << "  total: #{human_bytes(data[:total_bytes])} across #{data[:file_count]} files\n"
-    out << "  by subdirectory (top-level):\n"
-    data[:subdirs].first(10).each do |sd|
-      out << format("    %-30s %10s  (%d files)\n", sd[:name], human_bytes(sd[:bytes]), sd[:files])
-    end
-  end
-
-  out << "\nTOP #{opts.top_n} LARGEST FILES\n"
-  report[:largest_files].each_with_index do |f, i|
-    out << format("  %2d. %10s  %s  (mtime %s)\n", i + 1, human_bytes(f[:bytes]), f[:path], f[:mtime])
-  end
-
-  cu = report[:cleanup]
-  out << "\nCLEANUP CANDIDATES (older than #{cu[:older_than_days]}d, matching #{cu[:patterns].join(', ')})\n"
-  out << "  candidates: #{cu[:candidate_count]}\n"
-  out << "  reclaimable: #{human_bytes(cu[:reclaimable_bytes])}\n"
-  cu[:candidates].first(20).each do |c|
-    out << format("    %10s  %s  (mtime %s)\n", human_bytes(c[:bytes]), c[:path], c[:mtime])
-  end
-  if cu[:candidates].size < cu[:candidate_count]
-    out << "    ... and #{cu[:candidate_count] - cu[:candidates].size} more\n"
-  end
-
-  if !opts.dry_run
-    out << "\nDELETED: #{cu[:deleted_count]} files, #{human_bytes(cu[:deleted_bytes])} reclaimed\n"
-    unless cu[:delete_failed].empty?
-      out << "DELETE FAILURES:\n"
-      cu[:delete_failed].each { |f| out << "    #{f[:path]}: #{f[:error]}\n" }
-    end
-  else
-    out << "\n(dry-run: nothing deleted -- rerun with --delete to actually remove these files)\n"
-  end
-
-  unless report[:skipped].empty?
-    out << "\nSKIPPED (permission errors, #{report[:skipped].size} total)#{opts.quiet_skips ? '' : ':'}\n"
-    unless opts.quiet_skips
-      report[:skipped].first(15).each { |s| out << "    #{s[:path]}: #{s[:error]}\n" }
-      out << "    ... and #{report[:skipped].size - 15} more\n" if report[:skipped].size > 15
-    end
-  end
-
-  unless report[:threshold].empty?
-    out << "\nFILESYSTEM THRESHOLD CHECK (warn>=#{opts.warn_pct}% crit>=#{opts.crit_pct}%)\n"
-    report[:threshold].each do |t|
-      if t[:error]
-        out << format("  %-30s UNKNOWN  (%s)\n", t[:target], t[:error])
-      else
-        out << format("  %-30s %3d%%  [%s]  fs=%s mount=%s\n",
-                       t[:target], t[:use_pct], t[:status], t[:filesystem], t[:mount])
-      end
-    end
-  end
-
-  out
-end
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main(argv)
-  opts = parse_options(argv)
-  report = build_report(opts)
-
-  if opts.json
-    puts JSON.pretty_generate(report)
-  else
-    puts render_text(report, opts)
-  end
-
-  exit_status =
-    if report[:threshold].empty?
-      0
-    else
-      worst = worst_status(report[:threshold].map { |t| Struct.new(:status).new(t[:status]) })
-      EXIT_CODES[worst]
-    end
-
-  exit exit_status
-end
-
-main(ARGV) if $PROGRAM_NAME == __FILE__
+exit exit_code
