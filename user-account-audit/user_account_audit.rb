@@ -1,270 +1,154 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #
-# user_account_audit.rb
+# user_account_audit.rb -- Linux local-account security audit.
 #
-# Audits local Linux user accounts for common security misconfigurations by
-# parsing /etc/passwd (and, when readable, /etc/shadow) without shelling out
-# to external tools. Designed to run standalone on any box with a stock Ruby
-# install -- no gems required.
+# Reads /etc/passwd and (when readable) /etc/shadow and flags the classic
+# local-account misconfigurations that auditors and attackers both look for:
 #
-# Checks performed:
-#   1. Duplicate UID 0 accounts (any account besides "root" with UID 0 is a
-#      classic backdoor / privilege-escalation red flag).
-#   2. Duplicate UIDs across different usernames (breaks accountability --
-#      two "different" users are actually the same account to the kernel).
-#   3. Accounts with a login shell but a missing/non-existent home directory.
-#   4. Accounts with no password hash set at all in /etc/shadow (empty field,
-#      not "!" or "*") -- these can be logged into with an empty password if
-#      PAM allows it.
-#   5. Accounts whose password field shows "never expires" (empty max-age)
-#      combined with a real login shell -- flagged as informational, since
-#      it is common but worth knowing about on a hardened box.
-#   6. System accounts (UID < 1000 by convention) that have been given an
-#      interactive login shell instead of nologin/false.
+#   CRIT  uid0-not-root        an account other than root with UID 0
+#   CRIT  empty-password       shadow field is empty => login with no password
+#   CRIT  passwd-has-hash      password hash stored in world-readable /etc/passwd
+#   WARN  duplicate-uid        two accounts sharing a UID (indistinguishable in logs)
+#   WARN  system-acct-shell    system account (uid < 1000) with a real login shell
+#   WARN  stale-password       password older than --max-age days (default 365)
+#   WARN  no-password-aging    human account whose password never expires
+#   INFO  missing-home         home directory doesn't exist on disk
+#   INFO  world-writable-home  home directory writable by everyone
 #
-# Usage:
-#   ruby user_account_audit.rb                       # audit the live system
-#   ruby user_account_audit.rb --passwd FILE          # audit a passwd fixture
-#   ruby user_account_audit.rb --passwd FILE --shadow FILE
-#   ruby user_account_audit.rb --json                 # machine-readable output
-#   ruby user_account_audit.rb --min-uid 1000          # override system/human UID cutoff
+#   sudo ruby user_account_audit.rb            # full audit incl. shadow checks
+#   ruby user_account_audit.rb                 # passwd-only checks (no root)
+#   ruby user_account_audit.rb --json          # machine-readable
+#   ruby user_account_audit.rb --passwd F --shadow F   # audit copied files offline
 #
-# Exit codes (cron/CI friendly):
-#   0 - no findings
-#   1 - WARN-level findings only
-#   2 - CRIT-level findings present
+# Stdlib only: json, optparse, date. No gems. Exit codes: 0 clean, 1 warnings,
+# 2 criticals -- so it drops straight into cron or a CI compliance job.
 
-require 'optparse'
 require 'json'
-require 'etc'
-require 'time'
+require 'optparse'
+require 'date'
 
-# ---------------------------------------------------------------------------
-# Data object for a single finding so text and JSON output stay in sync.
-# ---------------------------------------------------------------------------
-Finding = Struct.new(:severity, :user, :check, :detail) do
-  def to_h
-    { severity: severity.to_s, user: user, check: check, detail: detail }
+options = { json: false, passwd: '/etc/passwd', shadow: '/etc/shadow', max_age: 365 }
+
+OptionParser.new do |o|
+  o.banner = 'Usage: [sudo] ruby user_account_audit.rb [options]'
+  o.on('--json', 'JSON output') { options[:json] = true }
+  o.on('--passwd FILE', 'passwd file to audit (default /etc/passwd)') { |v| options[:passwd] = v }
+  o.on('--shadow FILE', 'shadow file to audit (default /etc/shadow)') { |v| options[:shadow] = v }
+  o.on('--max-age DAYS', Integer, 'flag passwords older than DAYS (default 365)') { |v| options[:max_age] = v }
+end.parse!
+
+NOLOGIN_SHELLS = %w[/usr/sbin/nologin /sbin/nologin /bin/false /usr/bin/false].freeze
+findings = []   # { severity:, code:, user:, detail: }
+
+def note(findings, severity, code, user, detail)
+  findings << { severity: severity, code: code, user: user, detail: detail }
+end
+
+# --- parse /etc/passwd -----------------------------------------------------
+# name:pw:uid:gid:gecos:home:shell -- 7 colon-separated fields per line.
+
+abort("error: cannot read #{options[:passwd]}") unless File.readable?(options[:passwd])
+
+users = File.readlines(options[:passwd], chomp: true).filter_map do |line|
+  next if line.empty? || line.start_with?('#')
+  f = line.split(':', 7)
+  { name: f[0], pw: f[1], uid: f[2].to_i, gid: f[3].to_i,
+    home: f[5].to_s, shell: f[6].to_s }
+end
+
+# --- passwd-level checks ---------------------------------------------------
+
+users.each do |u|
+  # UID 0 grants root no matter what the account is called.
+  if u[:uid].zero? && u[:name] != 'root'
+    note(findings, 'CRIT', 'uid0-not-root', u[:name], 'account has UID 0 but is not root')
+  end
+  # Anything except "x" or "*" in the passwd pw field is a real hash sitting
+  # in a world-readable file -- crackable offline by any local user.
+  unless ['x', '*', '!', '!!', ''].include?(u[:pw])
+    note(findings, 'CRIT', 'passwd-has-hash', u[:name], 'password hash stored in world-readable passwd file')
+  end
+  # System/daemon accounts should not have interactive shells.
+  if u[:uid] < 1000 && u[:uid] != 0 && !NOLOGIN_SHELLS.include?(u[:shell]) && !u[:shell].empty?
+    note(findings, 'WARN', 'system-acct-shell', u[:name], "system account with login shell #{u[:shell]}")
+  end
+  # Home-dir hygiene -- only meaningful for accounts that can log in.
+  next if NOLOGIN_SHELLS.include?(u[:shell]) || u[:home].empty?
+  if !File.directory?(u[:home])
+    note(findings, 'INFO', 'missing-home', u[:name], "home #{u[:home]} does not exist")
+  elsif File.world_writable?(u[:home])
+    note(findings, 'INFO', 'world-writable-home', u[:name], "home #{u[:home]} is world-writable")
   end
 end
 
-class UserAccountAuditor
-  SEVERITY_RANK = { info: 0, warn: 1, crit: 2 }.freeze
+# Duplicate UIDs: group by uid, flag any uid owned by 2+ names.
+users.group_by { |u| u[:uid] }.each do |uid, group|
+  next if group.size < 2
+  names = group.map { |u| u[:name] }.join(', ')
+  note(findings, 'WARN', 'duplicate-uid', names, "UID #{uid} shared by #{group.size} accounts")
+end
 
-  def initialize(passwd_path:, shadow_path:, min_uid:)
-    @passwd_path = passwd_path
-    @shadow_path = shadow_path
-    @min_uid = min_uid
-    @findings = []
-  end
+# --- shadow-level checks (needs root, or an offline copy) ------------------
+# name:hash:lastchg:min:max:warn:inactive:expire -- lastchg is in days since
+# the Unix epoch; hash "" means NO password required; "!"/"*" mean locked.
 
-  def run
-    users = parse_passwd(@passwd_path)
-    shadow = @shadow_path && File.readable?(@shadow_path) ? parse_shadow(@shadow_path) : nil
-
-    check_duplicate_root_uid(users)
-    check_duplicate_uids(users)
-    check_missing_home_dirs(users)
-    check_system_accounts_with_shell(users)
-    check_shadow_findings(users, shadow) if shadow
-
-    @findings
-  end
-
-  private
-
-  # /etc/passwd fields: username:x:uid:gid:gecos:home:shell
-  def parse_passwd(path)
-    users = []
-    File.foreach(path) do |line|
-      line = line.strip
-      next if line.empty? || line.start_with?('#')
-
-      fields = line.split(':', -1)
-      next unless fields.size >= 7
-
-      users << {
-        name: fields[0],
-        uid: fields[2].to_i,
-        gid: fields[3].to_i,
-        gecos: fields[4],
-        home: fields[5],
-        shell: fields[6]
-      }
+shadow_read = false
+if File.readable?(options[:shadow])
+  shadow_read = true
+  today = (Date.today - Date.new(1970, 1, 1)).to_i
+  File.readlines(options[:shadow], chomp: true).each do |line|
+    next if line.empty? || line.start_with?('#')
+    f = line.split(':', 9)
+    name, hash, lastchg, maxdays = f[0], f[1].to_s, f[2].to_s, f[4].to_s
+    user = users.find { |u| u[:name] == name }
+    locked = hash.start_with?('!', '*')
+    if hash.empty?
+      note(findings, 'CRIT', 'empty-password', name, 'no password set -- login succeeds with empty password')
     end
-    users
-  end
-
-  # /etc/shadow fields: username:password_hash:last_change:min:max:warn:inactive:expire:reserved
-  def parse_shadow(path)
-    shadow = {}
-    File.foreach(path) do |line|
-      line = line.strip
-      next if line.empty? || line.start_with?('#')
-
-      fields = line.split(':', -1)
-      next unless fields.size >= 8
-
-      shadow[fields[0]] = {
-        hash: fields[1],
-        max_age: fields[4]
-      }
-    end
-    shadow
-  end
-
-  NOLOGIN_SHELLS = %w[/usr/sbin/nologin /sbin/nologin /bin/false /usr/bin/false].freeze
-
-  def interactive_shell?(shell)
-    return false if shell.nil? || shell.empty?
-    return false if NOLOGIN_SHELLS.include?(shell)
-
-    true
-  end
-
-  def check_duplicate_root_uid(users)
-    zero_uid_users = users.select { |u| u[:uid].zero? }
-    extras = zero_uid_users.reject { |u| u[:name] == 'root' }
-    extras.each do |u|
-      add(:crit, u[:name], 'duplicate-root-uid',
-          "UID 0 shared with account '#{u[:name]}' -- this account has full root " \
-          'privileges. Verify it is expected; if not, this is likely a backdoor.')
-    end
-  end
-
-  def check_duplicate_uids(users)
-    users.group_by { |u| u[:uid] }.each do |uid, group|
-      next if group.size < 2
-      next if uid.zero? # already covered by check_duplicate_root_uid with clearer messaging
-
-      names = group.map { |u| u[:name] }.join(', ')
-      group.each do |u|
-        add(:warn, u[:name], 'duplicate-uid',
-            "UID #{uid} is shared by multiple accounts (#{names}). These accounts " \
-            'are indistinguishable at the filesystem/permission level.')
+    # Aging checks only matter for unlocked, real-shell human accounts.
+    next if locked || hash.empty? || user.nil? || NOLOGIN_SHELLS.include?(user[:shell])
+    if !lastchg.empty? && lastchg.to_i.positive?
+      age = today - lastchg.to_i
+      if age > options[:max_age]
+        note(findings, 'WARN', 'stale-password', name, "password last changed #{age} days ago")
       end
     end
-  end
-
-  def check_missing_home_dirs(users)
-    users.each do |u|
-      next unless interactive_shell?(u[:shell])
-      next if u[:home].nil? || u[:home].empty?
-
-      unless Dir.exist?(u[:home])
-        add(:warn, u[:name], 'missing-home-dir',
-            "Home directory '#{u[:home]}' does not exist, but the account has " \
-            "login shell '#{u[:shell]}'.")
-      end
-    end
-  end
-
-  def check_system_accounts_with_shell(users)
-    users.each do |u|
-      next unless u[:uid] < @min_uid
-      next if u[:name] == 'root'
-      next unless interactive_shell?(u[:shell])
-
-      add(:warn, u[:name], 'system-account-interactive-shell',
-          "System account (UID #{u[:uid]}) has an interactive shell " \
-          "'#{u[:shell]}' instead of nologin/false.")
-    end
-  end
-
-  def check_shadow_findings(users, shadow)
-    users.each do |u|
-      entry = shadow[u[:name]]
-      next unless entry
-      next unless interactive_shell?(u[:shell])
-
-      hash = entry[:hash]
-      if hash == ''
-        add(:crit, u[:name], 'empty-password-hash',
-            'Password hash field in /etc/shadow is empty -- account may be ' \
-            'loggable-in with a blank password depending on PAM config.')
-      elsif !hash.start_with?('!', '*')
-        if entry[:max_age].nil? || entry[:max_age].empty?
-          add(:info, u[:name], 'password-never-expires',
-              'Account has a set password with no maximum password age configured.')
-        end
-      end
-    end
-  end
-
-  def add(severity, user, check, detail)
-    @findings << Finding.new(severity, user, check, detail)
-  end
-end
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-def parse_options(argv)
-  opts = { passwd: '/etc/passwd', shadow: '/etc/shadow', json: false, min_uid: 1000 }
-  parser = OptionParser.new do |o|
-    o.banner = 'Usage: ruby user_account_audit.rb [options]'
-    o.on('--passwd FILE', 'Path to passwd-format file (default: /etc/passwd)') { |v| opts[:passwd] = v }
-    o.on('--shadow FILE', 'Path to shadow-format file (default: /etc/shadow, skipped if unreadable)') { |v| opts[:shadow] = v }
-    o.on('--min-uid N', Integer, 'UID cutoff between system and human accounts (default: 1000)') { |v| opts[:min_uid] = v }
-    o.on('--json', 'Emit machine-readable JSON instead of text') { opts[:json] = true }
-    o.on('-h', '--help', 'Show this help') do
-      puts o
-      exit 0
-    end
-  end
-  parser.parse!(argv)
-  opts
-end
-
-def print_text_report(findings, users_scanned)
-  puts "user_account_audit: scanned #{users_scanned} accounts, #{findings.size} finding(s)"
-  puts '-' * 72
-
-  if findings.empty?
-    puts 'No issues found.'
-    return
-  end
-
-  %i[crit warn info].each do |sev|
-    group = findings.select { |f| f.severity == sev }
-    next if group.empty?
-
-    puts "\n[#{sev.to_s.upcase}] (#{group.size})"
-    group.each do |f|
-      puts "  - #{f.user}: #{f.check}"
-      puts "      #{f.detail}"
+    if user[:uid] >= 1000 && (maxdays.empty? || maxdays.to_i >= 99_999 || maxdays.to_i == -1)
+      note(findings, 'WARN', 'no-password-aging', name, 'password never expires (max age unset)')
     end
   end
 end
 
-if __FILE__ == $PROGRAM_NAME
-  options = parse_options(ARGV)
+# --- output ----------------------------------------------------------------
 
-  unless File.readable?(options[:passwd])
-    warn "Cannot read passwd file: #{options[:passwd]}"
-    exit 3
-  end
+sev_rank = { 'CRIT' => 0, 'WARN' => 1, 'INFO' => 2 }
+findings.sort_by! { |f| sev_rank[f[:severity]] }
+crit = findings.count { |f| f[:severity] == 'CRIT' }
+warn = findings.count { |f| f[:severity] == 'WARN' }
 
-  auditor = UserAccountAuditor.new(
-    passwd_path: options[:passwd],
-    shadow_path: options[:shadow],
-    min_uid: options[:min_uid]
+if options[:json]
+  puts JSON.pretty_generate(
+    'audited'       => options[:passwd],
+    'shadow_read'   => shadow_read,
+    'accounts'      => users.size,
+    'findings'      => findings.map { |f| f.transform_keys(&:to_s) },
+    'summary'       => { 'crit' => crit, 'warn' => warn,
+                         'info' => findings.size - crit - warn }
   )
-  findings = auditor.run
-  users_scanned = File.readlines(options[:passwd]).reject { |l| l.strip.empty? || l.start_with?('#') }.size
-
-  if options[:json]
-    puts JSON.pretty_generate(
-      scanned_at: Time.now.utc.iso8601,
-      users_scanned: users_scanned,
-      finding_count: findings.size,
-      findings: findings.map(&:to_h)
-    )
+else
+  puts "user account audit -- #{options[:passwd]} (#{users.size} accounts)"
+  puts "shadow checks: #{shadow_read ? 'enabled' : 'SKIPPED (not readable -- run as root)'}"
+  puts
+  if findings.empty?
+    puts 'no findings -- clean.'
   else
-    print_text_report(findings, users_scanned)
+    findings.each do |f|
+      puts format('%-5s %-20s %-18s %s', f[:severity], f[:code], f[:user], f[:detail])
+    end
+    puts
+    puts "#{crit} critical, #{warn} warning, #{findings.size - crit - warn} info"
   end
-
-  worst = findings.map { |f| UserAccountAuditor::SEVERITY_RANK[f.severity] }.max || -1
-  exit(worst >= UserAccountAuditor::SEVERITY_RANK[:crit] ? 2 : worst >= UserAccountAuditor::SEVERITY_RANK[:warn] ? 1 : 0)
 end
+
+exit(crit.positive? ? 2 : warn.positive? ? 1 : 0)
