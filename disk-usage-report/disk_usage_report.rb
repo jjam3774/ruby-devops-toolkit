@@ -1,218 +1,155 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #
-# disk_usage_report.rb — disk usage reporting with snapshot diffing.
+# disk_usage_report.rb -- disk usage reporting and growth tracking for Linux.
 #
-# Walks one or more directory trees, reports the largest subdirectories and
-# files, checks filesystem fullness against warn/crit thresholds, and —
-# the part `du` won't do for you — persists a JSON snapshot each run so the
-# NEXT run can tell you what actually GREW since last time. Finding out that
-# /var/log is 40 GB is useful once; finding out it grew 6 GB overnight is
-# useful every day.
+# Walks one or more directory trees, reports the largest directories and
+# files, and (optionally) compares against a saved snapshot so you can see
+# WHICH paths grew since the last run -- the question `df` never answers.
 #
-# Usage:
-#   ruby disk_usage_report.rb [options] DIR [DIR ...]
+#   ruby disk_usage_report.rb /var /home                # one-off report
+#   ruby disk_usage_report.rb /var --top 15             # more rows
+#   ruby disk_usage_report.rb /var --snapshot /tmp/var.json   # save baseline
+#   ruby disk_usage_report.rb /var --snapshot /tmp/var.json   # next run: growth report
+#   ruby disk_usage_report.rb /var --json               # machine-readable
+#   ruby disk_usage_report.rb /var --alert-gb 5         # exit 2 if any dir > 5 GiB
 #
-#   -n, --top N            show top N entries per section (default 10)
-#   -d, --depth N          aggregate directory sizes at depth N below each
-#                          root (default 1: immediate children)
-#   -s, --snapshot FILE    read previous snapshot from FILE (if it exists),
-#                          diff against it, then overwrite it with this run
-#   -w, --warn PCT         WARN when a filesystem is >= PCT% full (default 80)
-#   -c, --crit PCT         CRIT when a filesystem is >= PCT% full (default 90)
-#   -g, --growth-warn MB   WARN when a directory grew >= MB since snapshot
-#                          (default 512)
-#   -j, --json             emit JSON instead of text
-#   -x, --one-file-system  don't cross filesystem boundaries while walking
-#
-# Exit codes: 0 = OK, 1 = WARN, 2 = CRIT. Cron/Nagios friendly.
-#
-# Stdlib only — no gems. Tested on Ruby 3.0+.
+# Stdlib only: find, json, optparse. No gems.
 
-require 'optparse'
-require 'json'
 require 'find'
+require 'json'
+require 'optparse'
 
-# ---------------------------------------------------------------------------
-# Options
-# ---------------------------------------------------------------------------
 options = {
-  top: 10, depth: 1, snapshot: nil,
-  warn_pct: 80, crit_pct: 90, growth_warn_mb: 512,
-  json: false, one_fs: false
+  top: 10,          # how many rows to show per table
+  json: false,      # emit JSON instead of text
+  snapshot: nil,    # path to snapshot file (read old + write new)
+  alert_gb: nil,    # threshold: exit 2 if any first-level dir exceeds this
+  min_mb: 1         # ignore files smaller than this in the big-files table
 }
 
 OptionParser.new do |o|
-  o.banner = 'Usage: ruby disk_usage_report.rb [options] DIR [DIR ...]'
-  o.on('-n', '--top N', Integer)            { |v| options[:top] = v }
-  o.on('-d', '--depth N', Integer)          { |v| options[:depth] = v }
-  o.on('-s', '--snapshot FILE', String)     { |v| options[:snapshot] = v }
-  o.on('-w', '--warn PCT', Integer)         { |v| options[:warn_pct] = v }
-  o.on('-c', '--crit PCT', Integer)         { |v| options[:crit_pct] = v }
-  o.on('-g', '--growth-warn MB', Integer)   { |v| options[:growth_warn_mb] = v }
-  o.on('-j', '--json')                      { options[:json] = true }
-  o.on('-x', '--one-file-system')           { options[:one_fs] = true }
+  o.banner = 'Usage: ruby disk_usage_report.rb DIR [DIR...] [options]'
+  o.on('--top N', Integer, 'Rows per table (default 10)') { |v| options[:top] = v }
+  o.on('--json', 'JSON output') { options[:json] = true }
+  o.on('--snapshot FILE', 'Save/compare a usage snapshot for growth tracking') { |v| options[:snapshot] = v }
+  o.on('--alert-gb N', Float, 'Exit 2 if any first-level directory exceeds N GiB') { |v| options[:alert_gb] = v }
+  o.on('--min-mb N', Float, 'Minimum file size for the big-files table (default 1)') { |v| options[:min_mb] = v }
 end.parse!
 
-roots = ARGV.map { |a| File.expand_path(a) }
-abort 'error: give me at least one directory to scan' if roots.empty?
-roots.each { |r| abort "error: not a directory: #{r}" unless File.directory?(r) }
+roots = ARGV
+abort('error: give me at least one directory to scan') if roots.empty?
+roots.each { |r| abort("error: #{r} is not a directory") unless File.directory?(r) }
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --- helpers ---------------------------------------------------------------
+
 def human(bytes)
   units = %w[B KiB MiB GiB TiB]
-  size  = bytes.to_f
-  unit  = 0
-  while size >= 1024 && unit < units.size - 1
+  size = bytes.to_f
+  i = 0
+  while size >= 1024 && i < units.size - 1
     size /= 1024
-    unit += 1
+    i += 1
   end
-  format(unit.zero? ? '%d %s' : '%.1f %s', size, units[unit])
+  format(i.zero? ? '%d %s' : '%.1f %s', size, units[i])
 end
 
-# Aggregation bucket for a path: which depth-N ancestor a file belongs to.
-def bucket_for(path, root, depth)
-  rel = path[(root.length + 1)..]
-  return root if rel.nil? || rel.empty?
+# --- scan ------------------------------------------------------------------
+# One pass per root: accumulate per-directory totals (each file's size is
+# charged to every ancestor directory up to the root, giving `du`-style
+# cumulative totals) and remember the biggest individual files.
 
-  parts = rel.split(File::SEPARATOR)
-  return root if parts.length <= depth && !File.directory?(path)
-
-  File.join(root, parts.first(depth))
-end
-
-# ---------------------------------------------------------------------------
-# Walk the trees
-# ---------------------------------------------------------------------------
-dir_sizes   = Hash.new(0)          # bucket path  -> bytes
-big_files   = []                   # [bytes, path] min-heap-ish (we sort later)
-errors      = 0
-file_count  = 0
+dir_totals = Hash.new(0)      # "/var/log" => bytes (cumulative)
+big_files  = []               # [ [bytes, path], ... ]
+file_count = 0
+errors     = 0
+min_bytes  = (options[:min_mb] * 1024 * 1024).to_i
 
 roots.each do |root|
-  root_dev = File.lstat(root).dev
+  root = File.expand_path(root)
   Find.find(root) do |path|
-    begin
-      st = File.lstat(path)
-    rescue SystemCallError
-      errors += 1
-      next
-    end
-
-    # Optionally refuse to wander onto other mounts (/proc, NFS, ...).
-    if st.directory? && options[:one_fs] && st.dev != root_dev
-      Find.prune
-      next
-    end
-
-    next unless st.file?
-
+    stat = File.lstat(path)          # lstat: don't follow symlinks (no loops)
+    next unless stat.file?
     file_count += 1
-    dir_sizes[bucket_for(path, root, options[:depth])] += st.size
-    big_files << [st.size, path]
-    # Keep the candidate list small; no need to hold every file in RAM.
-    big_files = big_files.max_by(options[:top] * 4) { |s, _| s } if big_files.size > options[:top] * 8
+    size = stat.size
+    big_files << [size, path] if size >= min_bytes
+    # charge this file's size to every ancestor dir up to (and incl.) root
+    dir = File.dirname(path)
+    while dir.start_with?(root)
+      dir_totals[dir] += size
+      break if dir == root
+      dir = File.dirname(dir)
+    end
+  rescue Errno::EACCES, Errno::ENOENT, Errno::ELOOP
+    errors += 1                      # unreadable/vanished paths: count, move on
   end
 end
 
-top_dirs  = dir_sizes.sort_by { |_, v| -v }.first(options[:top])
-top_files = big_files.max_by(options[:top]) { |s, _| s }
-              .sort_by { |s, _| -s }
+big_files.sort_by! { |s, _| -s }
+big_files = big_files.first(options[:top])
+top_dirs = dir_totals.sort_by { |_, s| -s }.first(options[:top])
 
-# ---------------------------------------------------------------------------
-# Filesystem fullness via `df` (POSIX -P output is stable and parseable)
-# ---------------------------------------------------------------------------
-fs_alerts = []
-filesystems = []
-roots.uniq.each do |root|
-  out = `df -kP #{root} 2>/dev/null`.lines
-  next if out.length < 2
+# --- growth tracking -------------------------------------------------------
+# The snapshot is just the dir_totals hash dumped to JSON. On the next run we
+# diff current totals against it and report the biggest movers.
 
-  cols = out[1].split
-  next if cols.length < 6
-
-  pct = cols[4].delete('%').to_i
-  fs  = { mount: cols[5], size_kb: cols[1].to_i, used_kb: cols[2].to_i, used_pct: pct }
-  next if filesystems.any? { |f| f[:mount] == fs[:mount] }
-
-  filesystems << fs
-  level = pct >= options[:crit_pct] ? 'CRIT' : (pct >= options[:warn_pct] ? 'WARN' : nil)
-  fs_alerts << { level: level, mount: fs[:mount], used_pct: pct } if level
+growth = nil
+if options[:snapshot]
+  if File.exist?(options[:snapshot])
+    old = JSON.parse(File.read(options[:snapshot]))
+    growth = dir_totals.map { |dir, size| [dir, size - old.fetch(dir, 0)] }
+                       .reject { |_, delta| delta.zero? }
+                       .sort_by { |_, delta| -delta }
+                       .first(options[:top])
+  end
+  File.write(options[:snapshot], JSON.generate(dir_totals))
 end
 
-# ---------------------------------------------------------------------------
-# Snapshot diffing: what grew since last run?
-# ---------------------------------------------------------------------------
-growth = []
-if options[:snapshot]
-  previous = {}
-  if File.exist?(options[:snapshot])
-    begin
-      previous = JSON.parse(File.read(options[:snapshot]))['dirs'] || {}
-    rescue JSON::ParserError
-      warn "warning: snapshot #{options[:snapshot]} is corrupt, ignoring"
+# --- alerts ----------------------------------------------------------------
+# Check the first-level children of each root against --alert-gb.
+
+alerts = []
+if options[:alert_gb]
+  limit = (options[:alert_gb] * 1024**3).to_i
+  roots.each do |root|
+    root = File.expand_path(root)
+    dir_totals.each do |dir, size|
+      next unless File.dirname(dir) == root && size > limit
+      alerts << { 'dir' => dir, 'bytes' => size }
     end
   end
-
-  dir_sizes.each do |path, bytes|
-    delta = bytes - (previous[path] || 0)
-    growth << { path: path, bytes: bytes, delta: delta } if delta.abs > 0 && previous.key?(path)
-  end
-  growth.sort_by! { |g| -g[:delta] }
-
-  # Persist this run for next time (write-then-rename would be even safer).
-  File.write(options[:snapshot],
-             JSON.pretty_generate(scanned_at: Time.now.to_s, dirs: dir_sizes))
 end
 
-growth_alerts = growth.select { |g| g[:delta] >= options[:growth_warn_mb] * 1024 * 1024 }
-
-# ---------------------------------------------------------------------------
-# Verdict + output
-# ---------------------------------------------------------------------------
-exit_code = 0
-exit_code = 1 if fs_alerts.any? { |a| a[:level] == 'WARN' } || growth_alerts.any?
-exit_code = 2 if fs_alerts.any? { |a| a[:level] == 'CRIT' }
+# --- output ----------------------------------------------------------------
 
 if options[:json]
   puts JSON.pretty_generate(
-    scanned_roots: roots, files_seen: file_count, walk_errors: errors,
-    filesystems: filesystems,
-    top_dirs: top_dirs.map  { |p, b| { path: p, bytes: b } },
-    top_files: top_files.map { |b, p| { path: p, bytes: b } },
-    growth: growth.first(options[:top]),
-    alerts: fs_alerts + growth_alerts.map { |g| { level: 'WARN', path: g[:path], grew: g[:delta] } },
-    exit_code: exit_code
+    'scanned_roots' => roots,
+    'files_seen'    => file_count,
+    'skipped_paths' => errors,
+    'top_dirs'      => top_dirs.map  { |d, s| { 'dir' => d, 'bytes' => s } },
+    'top_files'     => big_files.map { |s, f| { 'file' => f, 'bytes' => s } },
+    'growth'        => growth&.map   { |d, delta| { 'dir' => d, 'delta_bytes' => delta } },
+    'alerts'        => alerts
   )
 else
-  puts "disk_usage_report — #{Time.now.strftime('%Y-%m-%d %H:%M:%S')}"
-  puts "scanned #{roots.join(', ')} (#{file_count} files, #{errors} unreadable)"
+  puts "disk usage report -- #{roots.join(', ')}"
+  puts "files scanned: #{file_count}  (#{errors} unreadable paths skipped)"
   puts
-
-  filesystems.each do |fs|
-    flag = fs[:used_pct] >= options[:crit_pct] ? ' [CRIT]' :
-           fs[:used_pct] >= options[:warn_pct] ? ' [WARN]' : ''
-    puts format('filesystem %-20s %3d%% full%s', fs[:mount], fs[:used_pct], flag)
+  puts format('%-12s %s', 'SIZE', 'LARGEST DIRECTORIES (cumulative)')
+  top_dirs.each { |d, s| puts format('%-12s %s', human(s), d) }
+  puts
+  puts format('%-12s %s', 'SIZE', "LARGEST FILES (>= #{options[:min_mb]} MB)")
+  big_files.each { |s, f| puts format('%-12s %s', human(s), f) }
+  if growth
+    puts
+    puts format('%-12s %s', 'GROWTH', 'BIGGEST MOVERS SINCE LAST SNAPSHOT')
+    growth.each { |d, delta| puts format('%-12s %s', (delta.positive? ? '+' : '') + human(delta.abs), d) }
+  elsif options[:snapshot]
+    puts
+    puts "snapshot saved to #{options[:snapshot]} -- run again to see growth"
   end
-
-  puts "\ntop #{options[:top]} directories (depth #{options[:depth]}):"
-  top_dirs.each { |p, b| puts format('  %10s  %s', human(b), p) }
-
-  puts "\ntop #{options[:top]} files:"
-  top_files.each { |b, p| puts format('  %10s  %s', human(b), p) }
-
-  unless growth.empty?
-    puts "\ngrowth since last snapshot:"
-    growth.first(options[:top]).each do |g|
-      sign = g[:delta].positive? ? '+' : '-'
-      flag = g[:delta] >= options[:growth_warn_mb] * 1024 * 1024 ? ' [WARN]' : ''
-      puts format('  %s%9s  %s%s', sign, human(g[:delta].abs), g[:path], flag)
-    end
-  end
-
-  puts "\nverdict: #{%w[OK WARN CRIT][exit_code]}"
+  alerts.each { |a| puts "\nALERT: #{a['dir']} is #{human(a['bytes'])} (over #{options[:alert_gb]} GiB limit)" }
 end
 
-exit exit_code
+exit(alerts.empty? ? 0 : 2)   # non-zero on alert => drops into cron/Nagios cleanly
