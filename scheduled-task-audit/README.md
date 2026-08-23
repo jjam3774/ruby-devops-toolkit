@@ -1,117 +1,108 @@
 # scheduled-task-audit
 
-A security audit of Windows Scheduled Tasks in one Ruby file. Scheduled tasks
-are a favorite persistence mechanism ([MITRE ATT&CK T1053.005](https://attack.mitre.org/techniques/T1053/005/))
-and one of the least-reviewed corners of a Windows fleet. This script
-enumerates every task — including hidden ones — via the Task Scheduler COM API
-(`Schedule.Service` through `win32ole`) and flags privilege-escalation and
-hygiene risks.
+Windows Scheduled Task security audit in Ruby, via the `Schedule.Service` COM API
+(the same interface `schtasks.exe` and `taskschd.msc` use). Walks the entire task
+tree and flags the patterns that show up in real privilege-escalation and
+persistence findings.
 
-![Architecture](img/task_audit_arch.png)
-
-## Findings
-
-| Severity | Rule | Meaning |
-|---|---|---|
-| CRIT | `exec-from-writable` | Task runs privileged (SYSTEM/admin/highest run level) but its action binary lives in a user-writable directory (`%TEMP%`, `Downloads`, non-Microsoft `ProgramData`, ...). Anyone who can replace that file owns the machine. |
-| CRIT | `missing-binary` | The action's executable no longer exists on disk — either debris or a hijackable path. |
-| WARN | `hidden-task` | Task is flagged hidden. Legitimate hidden tasks exist; so does malware. |
-| WARN | `stale-disabled` | Disabled and hasn't run in > `--stale-days` (default 180) — audit debris. |
+![architecture](img/task_audit_arch.png)
 
 ## Prerequisites
 
-- Windows with Ruby (any [RubyInstaller](https://rubyinstaller.org/) build —
-  `win32ole` ships in the stdlib). No gems.
-- An **elevated** prompt, or you will only see tasks your user can read.
-- The test harness (`test_scheduled_task_audit.rb`) runs on **any** OS.
+- **Windows** with Ruby that includes the `win32ole` standard library
+  (RubyInstaller builds do). No gems required.
+- Run from an **elevated** prompt so the COM API enumerates every task folder.
+- The pure classification logic is cross-platform and is exercised by the included
+  stub test harness, which runs on Linux/macOS.
 
 ## Usage
 
-```
+```powershell
+# audit the local machine (run elevated)
 ruby scheduled_task_audit.rb
+
+# machine-readable
 ruby scheduled_task_audit.rb --json
-ruby scheduled_task_audit.rb --root "\Microsoft\Windows" --stale-days 90
+
+# treat tasks idle for 180+ days as stale (default 90)
+ruby scheduled_task_audit.rb --stale 180
 ```
 
-Exit codes: `0` clean, `1` WARN findings only, `2` any CRIT — so it slots into
-a scheduled compliance job that fails loudly.
+Run the logic tests on any platform:
+
+```bash
+ruby scheduled_task_audit_test.rb
+```
+
+## What it flags
+
+| Severity | Code | Meaning |
+|----------|------|---------|
+| CRIT | `writable-binary-dir` | Privileged (SYSTEM/admin) task whose executable lives in a user-writable directory — drop a same-named EXE and it runs as SYSTEM |
+| CRIT | `temp-path-binary` | Action executable under `\Temp\` or `\AppData\` — classic malware persistence spot |
+| WARN | `unquoted-spacey-path` | Executable path has spaces but no quotes (unquoted-service-path style ambiguity) |
+| WARN | `hidden-task` | Task is flagged hidden in the Task Scheduler UI |
+| WARN | `stored-credentials` | Task logs on with a stored password (logon type 1) |
+| INFO | `stale-task` | Enabled task that hasn't run in `--stale` days |
 
 ## How it works
 
-The script is split into two layers, and that split is the point:
+The script is deliberately split into two layers:
 
-1. **Collector (thin, COM-touching)** — `WIN32OLE.new("Schedule.Service")`,
-   `Connect`, then a recursive walk of task folders with `GetTasks(1)` (the
-   `1` includes hidden tasks). For each task it extracts name, folder,
-   enabled, hidden, `run_as` principal, run level, last run time, and every
-   exec-type action's path — into plain Ruby hashes.
-2. **Analyzer (pure Ruby)** — path normalization (strips quotes, expands
-   `%SystemRoot%`/`%windir%`), a privileged-principal regex, a list of
-   user-writable directory patterns, and the four rules above. It takes a
-   `file_exists:` lambda instead of calling `File.exist?` directly, so tests
-   can stub the filesystem.
+1. **COM collection (`collect_tasks`, Windows-only).** Connects to
+   `Schedule.Service`, walks from the root folder recursively, calls `GetTasks(1)`
+   to include hidden tasks, and normalizes each task into a plain Ruby hash:
+   principal, logon type, hidden/enabled flags, action executables, and last run time.
+2. **Pure classification (`TaskAudit.classify`).** Takes that hash and returns the
+   findings — no COM, no I/O. Because it's pure, it can be unit-tested anywhere.
 
-Because the analyzer never touches COM, every detection rule is unit-testable
-on Linux/macOS — which is exactly how this was verified (below).
+`collect_tasks` requires `win32ole` lazily, so on a non-Windows box the main script
+exits with a clear message instead of a stack trace, and points you at the test harness.
 
-## Example output (from the stub harness fixtures)
+## Example output (stub harness)
 
 ```
-Scanned 8 scheduled tasks under '\'
-==============================================================================
-\Updater\SyncTask  (runs as: NT AUTHORITY\SYSTEM)
-  [CRIT] exec-from-writable   runs as 'NT AUTHORITY\SYSTEM' but executes C:\Users\bob\AppData\Local\Temp\sync.exe from a user-writable directory
-\Vendor\OldCleanup  (runs as: NT AUTHORITY\SYSTEM)
-  [CRIT] missing-binary       action binary C:\Program Files\Gone\uninstalled.exe does not exist on disk
-  [WARN] stale-disabled       disabled and last ran 400 days ago
-==============================================================================
-crit=2 warn=1
+PASS  clean system task
+PASS  SYSTEM task with exe in user-writable dir
+PASS  exe under AppData flags temp-path-binary
+PASS  SYSTEM + Windows\Temp flags both CRITs
+PASS  unquoted path with spaces
+PASS  hidden task
+PASS  stored credentials (logon type 1)
+PASS  stale enabled task
+...
+all tests passed
 ```
 
-## Testing notes — read this honestly
-
-`Schedule.Service` requires a real Windows host, and this repo's CI is Linux.
-So what's verified where:
-
-- **Analyzer: fully tested.** `test_scheduled_task_audit.rb` (minitest, 12
-  tests / 21 assertions, all passing) feeds realistic task fixtures through
-  `TaskAnalyzer.analyze` on Linux — every rule's fire and no-fire cases,
-  quote/env-var path normalization, the Microsoft-vs-non-Microsoft
-  `ProgramData` distinction, and the privileged-vs-unprivileged writable-path
-  logic.
-- **Collector: not machine-verified here.** It follows the documented
-  Task Scheduler scripting objects (`GetFolder`, `GetTasks`, `Definition`,
-  `Principal`, `Actions`) and mirrors working patterns from this repo's other
-  WMI/COM scripts, but run it on a disposable Windows box before you trust it
-  in production. If a property bombs on your Windows version, see
-  Troubleshooting.
+On a real Windows host, `scheduled_task_audit.rb` prints a severity-ranked table of
+findings across all task folders and exits `2`/`1`/`0` for CRIT/WARN/clean.
 
 ## Troubleshooting
 
-- **`WIN32OLERuntimeError` on `LastRunTime`** — tasks that never ran can
-  return an error or a sentinel date (1899-12-30); the collector already
-  rescues per-property, but treat sentinel dates as "never ran".
-- **Empty results** — run elevated; without admin you only enumerate a subset.
-- **`ProgramData` false positives** — if a vendor correctly ACLs its
-  `ProgramData` folder, add it to the exclusion in `WRITABLE_PATTERNS`.
-- **32/64-bit Ruby** — use 64-bit Ruby on 64-bit Windows or COM may show you
-  a redirected view of the filesystem for `File.exist?` checks.
-- **Localized group names** — the privileged-principal regex matches English
-  (`SYSTEM`, `Administrators`); extend `PRIVILEGED` for non-English installs.
+- **`win32ole not available`** — you're not on Windows (or on a Ruby build without it).
+  The detection logic is still fully testable via `scheduled_task_audit_test.rb`.
+- **Fewer tasks than `taskschd.msc` shows** — you're not elevated; some folders
+  (e.g. `\Microsoft\Windows\...`) won't enumerate without admin rights.
+- **`writable-binary-dir` false positives on ProgramData** — ACLs on `C:\ProgramData`
+  vary; confirm the actual directory ACL with `icacls` before treating it as exploitable.
+- **No `last_run` / stale never fires** — tasks that have never run report a placeholder
+  1899/1999 timestamp, which the script treats as "never ran" rather than stale.
+
+> **Note on testing honesty:** the COM enumeration path depends on WMI/Task Scheduler and
+> can only run on a real Windows host, so it is *not* executed in CI here. What **is**
+> verified — on Linux, via the stub harness — is every CRIT/WARN/INFO decision, using
+> realistic task fixtures fed straight into `TaskAudit.classify`.
 
 ## Extending
 
-- **Trigger analysis**: flag tasks with logon/boot triggers pointing at
-  scripts (`.ps1`, `.vbs`, `.js`) — a common persistence shape.
-- **Baseline diffing**: snapshot task lists to JSON and alert on *new* tasks,
-  like this repo's [registry-drift](../registry-drift) does for the registry.
-- **Signature checks**: shell out to `Get-AuthenticodeSignature` for each
-  action binary and flag unsigned executables in privileged tasks.
-- **schtasks fallback**: parse `schtasks /query /fo CSV /v` for hosts where
-  COM is blocked.
+- Resolve and check the real NTFS ACL of each binary directory instead of matching
+  path prefixes, for a definitive writable-dir verdict.
+- Parse action `Arguments` for suspicious `-enc`/`DownloadString` PowerShell patterns.
+- Emit findings as JSON to a SIEM, or wire into a scheduled compliance job that mails on CRIT.
+- Add allowlisting for known-good vendor tasks that legitimately live under AppData.
 
 ## References
 
-- Task Scheduler scripting objects: https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-objects
-- Ruby win32ole stdlib docs: https://docs.ruby-lang.org/en/master/WIN32OLE.html
-- MITRE ATT&CK T1053.005 (Scheduled Task): https://attack.mitre.org/techniques/T1053/005/
+- [Task Scheduler Scripting Objects (`Schedule.Service`)](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-scripting-objects)
+- [`TASK_LOGON_TYPE` enumeration](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/ne-taskschd-task_logon_type)
+- [Ruby `WIN32OLE`](https://docs.ruby-lang.org/en/3.4/WIN32OLE.html)
