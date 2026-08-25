@@ -1,184 +1,178 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #
-# proc_watchdog.rb -- Linux process watchdog built directly on /proc.
+# proc_watchdog.rb -- a /proc-based process watchdog for Linux.
 #
-# Give it a list of process name patterns you expect to be running (sshd,
-# cron, nginx, your app worker...). It walks /proc, finds matching processes,
-# samples CPU over a short interval, reads RSS, and reports:
+# Watches one or more process patterns, reports PID / CPU% / RSS / uptime for
+# every match, flags processes that exceed a memory ceiling, and (optionally)
+# runs a restart command when a watched pattern has no live process at all.
 #
-#   RUNNING   -> at least one match, same PID as last run
-#   RESTARTED -> running now, but the PID changed since the last run (WARN)
-#   MISSING   -> no matching process found (CRIT)
+# Uses ONLY the Ruby standard library. No gems, no agents, no daemons --
+# designed to run from cron or a systemd timer and exit with a meaningful code:
 #
-# Restart detection works via a small JSON state file that remembers the PIDs
-# seen on the previous run -- so a crash-loop that is "up" every time you look
-# still gets caught, because the PID keeps changing.
+#   0  every watched pattern healthy
+#   1  at least one WARN  (memory over soft ceiling)
+#   2  at least one CRIT  (pattern missing entirely, or restart attempted)
 #
 # Usage:
 #   ruby proc_watchdog.rb sshd cron
-#   ruby proc_watchdog.rb --state /var/tmp/watchdog.json --interval 1 --json nginx puma
+#   ruby proc_watchdog.rb --max-rss-mb 512 --json nginx postgres
+#   ruby proc_watchdog.rb --restart 'systemctl restart myapp' myapp
 #
-# Exit codes: 0 = all RUNNING, 1 = something RESTARTED, 2 = something MISSING.
-# Only the Ruby standard library is used: json, optparse. No gems.
-
-require "json"
-require "optparse"
-require "time"
+require 'optparse'
+require 'json'
+require 'etc'
+require 'time'
 
 options = {
-  state:    "/tmp/proc_watchdog_state.json",
-  interval: 1.0,   # seconds between the two CPU samples
-  json:     false
+  max_rss_mb: nil,     # soft memory ceiling per process (WARN when exceeded)
+  restart: nil,        # command to run when a pattern has zero live matches
+  interval: 1.0,       # CPU sampling window in seconds
+  json: false
 }
 
-OptionParser.new do |o|
-  o.banner = "Usage: ruby proc_watchdog.rb [options] pattern ..."
-  o.on("--state PATH", "State file for restart detection (default /tmp/proc_watchdog_state.json)") { |v| options[:state] = v }
-  o.on("--interval SEC", Float, "CPU sampling interval in seconds (default 1.0)") { |v| options[:interval] = v }
-  o.on("--json", "Emit JSON instead of the text table") { options[:json] = true }
-end.parse!
-
+parser = OptionParser.new do |o|
+  o.banner = 'Usage: proc_watchdog.rb [options] PATTERN [PATTERN...]'
+  o.on('--max-rss-mb MB', Integer, 'WARN when a matched process RSS exceeds MB') { |v| options[:max_rss_mb] = v }
+  o.on('--restart CMD', 'Run CMD when a pattern has no live process (CRIT)')    { |v| options[:restart] = v }
+  o.on('--interval SECS', Float, 'CPU sampling window (default 1.0)')           { |v| options[:interval] = v }
+  o.on('--json', 'Emit JSON instead of text')                                   { options[:json] = true }
+end
+parser.parse!(ARGV)
 patterns = ARGV
-abort("No patterns given. Try: ruby proc_watchdog.rb sshd cron") if patterns.empty?
-
-CLK_TCK   = 100                     # USER_HZ; getconf CLK_TCK on virtually every Linux
-PAGE_SIZE = 4096                    # bytes; getconf PAGESIZE if you need to be exact
+abort(parser.to_s) if patterns.empty?
 
 # ---------------------------------------------------------------------------
 # /proc plumbing
 # ---------------------------------------------------------------------------
 
-# Every numeric directory under /proc is one process.
-def pids
-  Dir.children("/proc").select { |d| d.match?(/\A\d+\z/) }.map(&:to_i)
-end
+CLK_TCK   = Etc.sysconf(Etc::SC_CLK_TCK)        # jiffies per second (usually 100)
+PAGE_SIZE = Etc.sysconf(Etc::SC_PAGESIZE)       # bytes per memory page
 
-# comm  = the short executable name (what `pgrep` matches by default).
-# cmdline = full argv, NUL-separated -- useful for matching "puma: worker 2".
-def read_proc(pid)
-  comm    = File.read("/proc/#{pid}/comm").strip
-  cmdline = File.read("/proc/#{pid}/cmdline").split("\0").join(" ")
-  # /proc/<pid>/stat field 14 utime + 15 stime (1-indexed), 22 starttime,
-  # 24 rss (in pages). comm can contain spaces/parens, so split AFTER the
-  # closing paren rather than naively on whitespace.
-  stat  = File.read("/proc/#{pid}/stat")
-  after = stat[(stat.rindex(")") + 2)..].split
-  {
-    pid:        pid,
-    comm:       comm,
-    cmdline:    cmdline.empty? ? "[#{comm}]" : cmdline,
-    cpu_ticks:  after[11].to_i + after[12].to_i,   # utime + stime
-    start_ticks: after[19].to_i,                   # starttime, ticks since boot
-    rss_bytes:  after[21].to_i * PAGE_SIZE
-  }
-rescue Errno::ENOENT, Errno::ESRCH, Errno::EACCES
-  nil   # the process exited (or is inaccessible) mid-scan; skip it
-end
-
+# Seconds the kernel has been up -- needed to turn a process start time
+# (measured in jiffies since boot) into a wall-clock age.
 def uptime_seconds
-  File.read("/proc/uptime").split[0].to_f
+  File.read('/proc/uptime').split.first.to_f
 end
 
-# A pattern matches on the process NAME, not the full command line: either
-# the kernel's comm field or the basename of argv[0]. Matching the raw
-# cmdline sounds convenient but is a classic false-positive trap -- e.g.
-# `bash -c "sleep 300"` would match a "sleep" watch via its argv even though
-# bash is not sleep. (The first version of this script did exactly that.)
-def match?(info, pat)
-  argv0 = File.basename(info[:cmdline].split(" ").first.to_s)
-  info[:comm].include?(pat) || argv0.include?(pat)
+# Parse /proc/<pid>/stat. Field 2 (comm) can contain spaces and parentheses --
+# "(tmux: server)" is a classic -- so split on the LAST ')' rather than
+# splitting the whole line on whitespace.
+def read_stat(pid)
+  raw   = File.read("/proc/#{pid}/stat")
+  lparen = raw.index('(')
+  rparen = raw.rindex(')')
+  comm   = raw[(lparen + 1)...rparen]
+  rest   = raw[(rparen + 2)..].split
+  {
+    comm: comm,
+    utime: rest[11].to_i,        # user-mode jiffies
+    stime: rest[12].to_i,        # kernel-mode jiffies
+    starttime: rest[19].to_i,    # jiffies after boot when process started
+    rss_pages: rest[21].to_i     # resident set size in pages
+  }
+rescue Errno::ENOENT, Errno::ESRCH
+  nil # process exited between listing and reading -- normal, skip it
 end
+
+# Full command line, NUL-separated in /proc; empty for kernel threads.
+def read_cmdline(pid)
+  File.read("/proc/#{pid}/cmdline").tr("\0", ' ').strip
+rescue Errno::ENOENT, Errno::EACCES
+  ''
+end
+
+def list_pids
+  Dir.children('/proc').select { |e| e.match?(/\A\d+\z/) }.map(&:to_i)
+end
+
+# A pattern matches on comm (the 15-char kernel name) or anywhere in cmdline.
+def matches?(pattern, stat, cmdline)
+  stat[:comm].include?(pattern) || cmdline.include?(pattern)
+end
+
+# ---------------------------------------------------------------------------
+# Sample twice to compute CPU%: delta jiffies / delta wall time.
+# ---------------------------------------------------------------------------
 
 def snapshot(patterns)
-  found = Hash.new { |h, k| h[k] = [] }
-  pids.each do |pid|
-    info = read_proc(pid)
-    next unless info
-    next if pid == Process.pid                 # never report the watchdog itself
+  found = {}
+  me = Process.pid
+  list_pids.each do |pid|
+    next if pid == me # never match ourselves (our argv contains the patterns)
+    stat = read_stat(pid)
+    next unless stat
+    cmdline = read_cmdline(pid)
+    next if cmdline.empty? && stat[:comm].empty?
     patterns.each do |pat|
-      found[pat] << info if match?(info, pat)  # a proc may match several patterns
+      next unless matches?(pat, stat, cmdline)
+      (found[pat] ||= {})[pid] = { stat: stat, cmdline: cmdline }
     end
   end
   found
 end
 
-# ---------------------------------------------------------------------------
-# Two samples, options[:interval] apart -> CPU% per process.
-# ---------------------------------------------------------------------------
 first  = snapshot(patterns)
 sleep options[:interval]
 second = snapshot(patterns)
+up     = uptime_seconds
 
-# Previous run's PIDs, for restart detection.
-prev_state = File.exist?(options[:state]) ? JSON.parse(File.read(options[:state])) : {}
-
-now_uptime = uptime_seconds
-rows = []
-new_state = {}
+results  = []
+exit_code = 0
 
 patterns.each do |pat|
-  procs = second[pat]
+  procs = second[pat] || {}
   if procs.empty?
-    rows << { pattern: pat, status: "MISSING", detail: "no matching process in /proc" }
-    new_state[pat] = []
+    entry = { pattern: pat, status: 'CRIT', reason: 'no live process matches pattern', processes: [] }
+    if options[:restart]
+      ok = system(options[:restart])
+      entry[:restart] = { command: options[:restart], success: !!ok }
+      entry[:reason] += ok ? ' -- restart command succeeded' : ' -- restart command FAILED'
+    end
+    results << entry
+    exit_code = 2
     next
   end
 
-  pids_now  = procs.map { |p| p[:pid] }.sort
-  pids_prev = (prev_state[pat] || []).sort
-  restarted = !pids_prev.empty? && pids_prev != pids_now
-  new_state[pat] = pids_now
-
-  procs.each do |p|
-    prev = first[pat].find { |q| q[:pid] == p[:pid] }
-    cpu_pct = if prev
-                dt = options[:interval]
-                100.0 * (p[:cpu_ticks] - prev[:cpu_ticks]) / CLK_TCK / dt
-              else
-                0.0
-              end
-    age = now_uptime - (p[:start_ticks].to_f / CLK_TCK)
-    rows << {
-      pattern:  pat,
-      status:   restarted ? "RESTARTED" : "RUNNING",
-      pid:      p[:pid],
-      comm:     p[:comm],
-      cpu_pct:  cpu_pct.round(1),
-      rss_mb:   (p[:rss_bytes] / 1024.0 / 1024.0).round(1),
-      uptime_s: age.round,
-      detail:   restarted ? "pids changed #{pids_prev.inspect} -> #{pids_now.inspect}" : nil
-    }.compact
+  plist = procs.map do |pid, info|
+    stat = info[:stat]
+    prev = first.dig(pat, pid, :stat)
+    cpu_pct =
+      if prev
+        delta_jiffies = (stat[:utime] + stat[:stime]) - (prev[:utime] + prev[:stime])
+        (delta_jiffies.to_f / CLK_TCK / options[:interval] * 100).round(1)
+      else
+        0.0 # brand-new process; no baseline sample
+      end
+    rss_mb = (stat[:rss_pages] * PAGE_SIZE / 1024.0 / 1024.0).round(1)
+    age_s  = (up - stat[:starttime].to_f / CLK_TCK).round
+    { pid: pid, comm: stat[:comm], cpu_pct: cpu_pct, rss_mb: rss_mb,
+      uptime_s: age_s, cmdline: info[:cmdline][0, 120] }
   end
+
+  over = options[:max_rss_mb] ? plist.select { |p| p[:rss_mb] > options[:max_rss_mb] } : []
+  status = over.empty? ? 'OK' : 'WARN'
+  reason = over.empty? ? "#{plist.size} live" :
+           "#{over.size} process(es) over #{options[:max_rss_mb]} MB RSS ceiling"
+  results << { pattern: pat, status: status, reason: reason, processes: plist }
+  exit_code = [exit_code, 1].max if status == 'WARN'
 end
 
-File.write(options[:state], JSON.pretty_generate(new_state))
-
 # ---------------------------------------------------------------------------
-# Output + exit code
+# Output
 # ---------------------------------------------------------------------------
-statuses  = rows.map { |r| r[:status] }
-exit_code = statuses.include?("MISSING") ? 2 : (statuses.include?("RESTARTED") ? 1 : 0)
 
 if options[:json]
-  puts JSON.pretty_generate(
-    generated_at: Time.now.utc.iso8601,
-    summary: { running:   statuses.count("RUNNING"),
-               restarted: statuses.count("RESTARTED"),
-               missing:   statuses.count("MISSING") },
-    processes: rows
-  )
+  puts JSON.pretty_generate(generated_at: Time.now.utc.iso8601, results: results)
 else
-  puts format("%-12s %-10s %7s %-16s %6s %8s %9s  %s",
-              "PATTERN", "STATUS", "PID", "COMM", "CPU%", "RSS(MB)", "UPTIME(S)", "DETAIL")
-  puts "-" * 92
-  rows.each do |r|
-    puts format("%-12s %-10s %7s %-16s %6s %8s %9s  %s",
-                r[:pattern], r[:status], r[:pid] || "-", r[:comm] || "-",
-                r[:cpu_pct] || "-", r[:rss_mb] || "-", r[:uptime_s] || "-", r[:detail])
+  results.each do |r|
+    badge = { 'OK' => '[ OK ]', 'WARN' => '[WARN]', 'CRIT' => '[CRIT]' }[r[:status]]
+    puts "#{badge} #{r[:pattern]} -- #{r[:reason]}"
+    r[:processes].each do |p|
+      puts format('        pid %-7d %-15s cpu %5.1f%%  rss %8.1f MB  up %6ds  %s',
+                  p[:pid], p[:comm], p[:cpu_pct], p[:rss_mb], p[:uptime_s], p[:cmdline])
+    end
   end
-  puts "-" * 92
-  puts "running=#{statuses.count('RUNNING')} restarted=#{statuses.count('RESTARTED')} missing=#{statuses.count('MISSING')}"
 end
 
 exit exit_code

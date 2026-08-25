@@ -1,103 +1,89 @@
 # proc-watchdog
 
-A Linux process watchdog built directly on `/proc` — no `ps`, no `pgrep`, no
-gems. Give it the names of processes that must be running (sshd, cron, nginx,
-your app worker) and it reports per-pattern status with CPU%, RSS, and uptime,
-plus **crash-loop detection**: a service that is "up" every time you look but
-whose PID keeps changing gets flagged as RESTARTED.
+A `/proc`-based process watchdog for Linux, in ~150 lines of standard-library
+Ruby. Watches one or more process patterns, reports **PID / CPU% / RSS /
+uptime** for every match, warns when a process crosses a memory ceiling, and
+optionally runs a restart command when a watched pattern has no live process
+at all.
 
-![Architecture](img/proc_watchdog_flow.png)
-
-## Why
-
-`systemctl is-active` tells you a unit is up *right now*. It does not tell you
-the daemon has quietly restarted 40 times since lunch, and on boxes without
-systemd (containers, ancient appliances, BSD-style init) you don't even get
-that. Walking `/proc` yourself is ~100 lines of Ruby, works everywhere Linux
-does, and teaches you exactly where tools like `ps` get their numbers.
+![sampling pipeline](img/proc_watchdog_flow.png)
 
 ## Prerequisites
 
-- Linux (anything with `/proc`). Ruby 2.7+ (tested on 3.0), stdlib only
-  (`json`, `optparse`).
-- Read access to `/proc` (any user for most fields; some processes of other
-  users may be invisible in hardened `hidepid` setups).
+- Ruby 2.7+ (tested on 3.0) — standard library only, no gems
+- Linux (reads `/proc/<pid>/stat`, `/proc/<pid>/cmdline`, `/proc/uptime`)
+- No root needed to *observe*; the `--restart` hook needs whatever privileges
+  the restart command itself needs
 
 ## Usage
 
+```bash
+# just report on sshd and cron
+ruby proc_watchdog.rb sshd cron
+
+# warn when any matched process exceeds 512 MB RSS
+ruby proc_watchdog.rb --max-rss-mb 512 nginx postgres
+
+# self-heal: if nothing matches "myapp", run the restart command
+ruby proc_watchdog.rb --restart 'systemctl restart myapp' myapp
+
+# machine-readable, for a monitoring pipeline
+ruby proc_watchdog.rb --json --max-rss-mb 512 nginx | jq .
 ```
-# One-shot check
-ruby proc_watchdog.rb sshd cron nginx
 
-# From cron every 5 minutes, JSON into your pipeline
-*/5 * * * *  ruby /opt/watchdog/proc_watchdog.rb --state /var/tmp/wd.json --json sshd nginx >> /var/log/wd.jsonl
-```
-
-Options: `--state PATH` (restart-detection state file, default
-`/tmp/proc_watchdog_state.json`), `--interval SEC` (CPU sampling window,
-default 1.0), `--json`.
-
-Exit codes: `0` all RUNNING, `1` something RESTARTED, `2` something MISSING.
+Exit codes: `0` all healthy, `1` at least one WARN (memory ceiling), `2` at
+least one CRIT (pattern missing; restart attempted if `--restart` given).
+Drop it straight into cron or a systemd timer.
 
 ## How it works
 
-1. Every numeric directory under `/proc` is a PID. For each, the script reads
-   `comm` (short name), `cmdline` (argv, NUL-separated) and `stat`.
-2. `stat` is parsed by splitting **after the last `)`** — the comm field can
-   itself contain spaces and parens, which is the classic bug in naive
-   parsers. Fields used: utime+stime (CPU ticks), starttime (uptime), rss.
-3. It samples twice, `--interval` apart: CPU% = Δticks / USER_HZ / interval.
-4. A pattern matches on `comm` or the basename of argv[0] — **not** the full
-   command line. (The first version matched raw cmdline and promptly reported
-   `bash -c "sleep 300"` as a match for `sleep`. The tutorial covers this
-   false-positive trap in detail.)
-5. The PIDs seen for each pattern are written to a JSON state file; on the
-   next run, same-pattern-different-PIDs means RESTARTED.
+1. **Two snapshots.** CPU% is a rate, but `/proc/<pid>/stat` only exposes
+   cumulative jiffies (`utime` + `stime`). So the script samples every matched
+   process twice, `--interval` seconds apart, and computes
+   `delta_jiffies / CLK_TCK / interval * 100` — exactly what `top` does.
+2. **Careful stat parsing.** Field 2 of `stat` (`comm`) may contain spaces and
+   parentheses — `(tmux: server)` is the classic. The parser splits on the
+   *last* `)` instead of naively splitting on whitespace.
+3. **RSS from pages.** Field 24 is resident pages; multiplied by
+   `Etc.sysconf(Etc::SC_PAGESIZE)` for bytes.
+4. **Self-exclusion.** The watchdog's own argv contains the patterns, so it
+   skips `Process.pid` — otherwise every pattern would always "match".
+5. **Race-tolerant.** Processes that exit between the directory listing and the
+   file read raise `ENOENT`/`ESRCH`; both are rescued and skipped.
 
 ## Example output
 
 ```
-PATTERN      STATUS         PID COMM               CPU%  RSS(MB) UPTIME(S)  DETAIL
---------------------------------------------------------------------------------------------
-sleep        RESTARTED       10 sleep               0.0      1.9         1  pids changed [7] -> [10]
-python3      RUNNING          8 python3             0.0      8.5         2
---------------------------------------------------------------------------------------------
-running=1 restarted=1 missing=0
+$ ruby proc_watchdog.rb --max-rss-mb 50 --restart "systemctl restart ghost-svc" "sleep 30" ghost-svc
+[WARN] sleep 30 -- 1 process(es) over 50 MB RSS ceiling
+        pid 7       ruby            cpu   0.0%  rss     97.3 MB  up      2s  ruby -e arr = "x" * 80_000_000; sleep 30
+[CRIT] ghost-svc -- no live process matches pattern -- restart command succeeded
+$ echo $?
+2
 ```
-
-## Testing notes
-
-Tested live in a Linux sandbox: watched real `sleep` and `python3` processes
-plus a deliberately absent `nginx` (MISSING, exit 2); killed and relaunched the
-`sleep` between runs to simulate a crash loop (RESTARTED, exit 1); a third
-steady-state run returned to all-RUNNING, exit 0. JSON mode verified the same
-way.
 
 ## Troubleshooting
 
-- **CPU% always 0.0** — your processes are genuinely idle, or your interval is
-  too short for slow tickers. Raise `--interval` to 2–5s.
-- **Wrong CLK_TCK/PAGE_SIZE** — the constants 100/4096 hold on essentially all
-  Linux; if you run exotic kernels check `getconf CLK_TCK` / `getconf PAGESIZE`
-  and adjust.
-- **RESTARTED after reboot** — expected: all PIDs changed. Delete the state
-  file in your boot sequence, or treat the first post-boot run as informational.
-- **Processes invisible** — `/proc` mounted with `hidepid=1/2` hides other
-  users' processes; run the watchdog as root or the service user.
-- **Two watchdogs, one state file** — give each cron entry its own `--state`
-  path or they will trample each other's restart detection.
+- **Everything matches your pattern** — patterns are substring matches against
+  `comm` *and* the full cmdline (like `pgrep -f`). A shell whose command text
+  contains your pattern will match. Use a more specific pattern.
+- **CPU% is always 0.0** — your `--interval` may be too short for a mostly idle
+  process; jiffies are coarse (usually 100/s).
+- **Kernel threads invisible** — they have an empty cmdline; they're matched by
+  `comm` only.
+- **`Errno::EACCES` on other users' cmdlines** — hardened kernels
+  (`hidepid=2` on `/proc`) restrict visibility; run as root or relax the mount
+  option.
 
-## Extending
+## Extending it
 
-- **Threshold alarms**: flag RSS above a per-pattern limit (leak detection) or
-  CPU% pegged at 100 for N consecutive runs.
-- **Auto-heal**: on MISSING, `systemctl restart <unit>` and record the action.
-- **Children/threads**: read `/proc/<pid>/task/` to count threads per process.
-- **Prometheus**: export `proc_up{pattern=...}`, `proc_rss_bytes`, etc. —
-  pairs with [prometheus-exporter](../prometheus-exporter) in this repo.
+- Add `%CPU` ceilings alongside the RSS ceiling
+- Track file-descriptor counts from `/proc/<pid>/fd`
+- Push the JSON to a Prometheus pushgateway or a webhook
+- Back-off logic: don't fire `--restart` more than N times per hour
 
 ## References
 
-- proc(5) man page: https://man7.org/linux/man-pages/man5/proc.5.html
-- Kernel docs for /proc: https://www.kernel.org/doc/html/latest/filesystems/proc.html
-- Ruby File/Dir stdlib: https://docs.ruby-lang.org/en/master/File.html
+- [proc(5) man page](https://man7.org/linux/man-pages/man5/proc.5.html)
+- [Ruby Etc module docs](https://docs.ruby-lang.org/en/3.0/Etc.html)
+- Blog post: https://tha-shed.com/ (Ruby for DevOps series)
