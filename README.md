@@ -62,6 +62,9 @@ in a few minutes and dropped straight onto a box.
 | [`inode-usage-monitor/inode_usage_monitor.rb`](inode-usage-monitor/) | Linux | Reports inode usage per filesystem, alerts on thresholds, and hunts the directories hoarding files (catches inode exhaustion `df -h` misses). |
 | [`duplicate-file-finder/duplicate_file_finder.rb`](duplicate-file-finder/) | Linux / macOS / Windows | Finds byte-for-byte duplicate files via size-bucket + partial + full SHA-256 hashing and reports reclaimable space. |
 | [`path-env-audit/path_env_audit.rb`](path-env-audit/) | Windows / Unix | Audits the PATH variable for privilege-escalation risks: a user-writable dir ahead of the system dirs, plus relative/duplicate/empty entries. |
+| [`wtmp-login-report/wtmp_login_report.rb`](wtmp-login-report/) | Linux | Parses binary wtmp/btmp login records with String#unpack: sessions with durations, live logins, and failed-login burst (brute-force) detection. |
+| [`unit-hardening-audit/unit_hardening_audit.rb`](unit-hardening-audit/) | Linux | Scores systemd service unit files 0-100 against a weighted sandboxing checklist (User=, ProtectSystem=, seccomp...) -- no running systemd required. |
+| [`win-account-audit/win_account_audit.rb`](win-account-audit/) | Windows | Audits local user accounts via WMI: enabled Guest, blank-password logons, stale accounts, and unexpected Administrators members. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
