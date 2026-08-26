@@ -65,6 +65,9 @@ in a few minutes and dropped straight onto a box.
 | [`wtmp-login-report/wtmp_login_report.rb`](wtmp-login-report/) | Linux | Parses binary wtmp/btmp login records with String#unpack: sessions with durations, live logins, and failed-login burst (brute-force) detection. |
 | [`unit-hardening-audit/unit_hardening_audit.rb`](unit-hardening-audit/) | Linux | Scores systemd service unit files 0-100 against a weighted sandboxing checklist (User=, ProtectSystem=, seccomp...) -- no running systemd required. |
 | [`win-account-audit/win_account_audit.rb`](win-account-audit/) | Windows | Audits local user accounts via WMI: enabled Guest, blank-password logons, stale accounts, and unexpected Administrators members. |
+| [`fstab-audit/fstab_audit.rb`](fstab-audit/) | Linux | Validates `/etc/fstab` against `/proc/mounts` and `/dev/disk/by-*`: duplicate mounts, unresolvable devices, missing hardening options, and reboot-breaking unmounted entries. |
+| [`systemd-timer-audit/systemd_timer_audit.rb`](systemd-timer-audit/) | Linux | Audits systemd timers by parsing `systemctl list-timers`/`list-units`: failed timers, failed timer-driven services, and timers with no next elapse. |
+| [`windows-software-inventory/windows_software_inventory.rb`](windows-software-inventory/) | Windows | Inventories installed software from the registry Uninstall keys (no `Win32_Product` self-repair) and flags watchlisted apps, missing publishers, and missing versions. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
