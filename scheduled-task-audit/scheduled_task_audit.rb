@@ -1,184 +1,168 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #
-# scheduled_task_audit.rb — audit Windows Scheduled Tasks for the quiet
-# persistence tricks and misconfigurations that accumulate in every fleet:
-# tasks running as SYSTEM out of user-writable directories, tasks whose
-# executable no longer exists, hidden tasks, and tasks that have been
-# failing forever without anyone noticing.
+# scheduled_task_audit.rb -- Windows Scheduled Task security audit via COM.
 #
-# Uses the Task Scheduler 2.0 COM API (Schedule.Service) via win32ole —
-# Ruby's stdlib COM bridge, so there is nothing to install beyond Ruby.
+# Walks the whole Task Scheduler tree (Schedule.Service COM API -- the same
+# thing schtasks.exe and taskschd.msc use) and flags the patterns that show
+# up in real privilege-escalation and persistence findings:
 #
-# Design note: collection (COM) and analysis (pure Ruby) are deliberately
-# separated. `TaskInfo` is a plain Struct, and every audit rule takes an
-# array of TaskInfo — which is what makes the logic testable on a machine
-# with no Task Scheduler at all (see test_scheduled_task_audit.rb).
+#   CRIT  writable-binary-dir   task runs as SYSTEM/admin but its executable
+#                               lives in a directory normal users can write to
+#                               (drop a same-named EXE => code runs as SYSTEM)
+#   CRIT  temp-path-binary      action executable lives under \Temp\ or
+#                               \AppData\ -- classic malware persistence spot
+#   WARN  hidden-task           task is flagged hidden in the UI
+#   WARN  stored-credentials    task logs on with a stored password (logon
+#                               type 1) -- credential material at rest
+#   WARN  unquoted-spacey-path  action path has spaces but no quotes
+#   INFO  stale-task            enabled task that hasn't run in --stale days
 #
-# Usage (on Windows, elevated prompt recommended so you see all tasks):
-#   ruby scheduled_task_audit.rb
-#   ruby scheduled_task_audit.rb --json
-#   ruby scheduled_task_audit.rb --all       # include Microsoft\* tasks too
+#   ruby scheduled_task_audit.rb                 # audit local machine (elevated)
+#   ruby scheduled_task_audit.rb --json          # machine-readable
+#   ruby scheduled_task_audit.rb --stale 180     # stale threshold (default 90)
 #
-# Exit codes: 0 = clean, 1 = warnings, 2 = criticals.
+# Requires: Windows, Ruby with the win32ole stdlib (ships with RubyInstaller).
+# Run from an elevated prompt so the COM API will enumerate all task folders.
+# Exit codes: 0 clean, 1 warnings, 2 criticals.
 
-require "json"
-require "optparse"
-require "time"
+require 'json'
+require 'optparse'
+require 'time'
 
-TaskInfo = Struct.new(
-  :path,          # "\MyCorp\nightly-sync"
-  :enabled,       # true/false
-  :hidden,        # true/false
-  :run_as,        # "SYSTEM", "MyCorp\\svc-backup", ...
-  :run_level,     # :highest or :limited
-  :action_exe,    # "C:\Users\bob\AppData\sync.exe" (first Exec action)
-  :action_args,   # its arguments
-  :last_result,   # 0 = success; anything else = last-run error code
-  :last_run,      # Time or nil
-  :missed_runs,   # integer
-  :exe_missing,   # true if collection checked File.exist? and it was gone
-  keyword_init: true
-)
-
-# --- audit rules (pure functions — no COM, no Windows required) ------------
-
-ELEVATED_PRINCIPALS = ["SYSTEM", "NT AUTHORITY\\SYSTEM", "LOCALSYSTEM"].freeze
-
-# Directories any local user can typically write to. An elevated task whose
-# binary sits under one of these can be swapped for a payload by ANY user —
-# instant privilege escalation.
-WRITABLE_ROOTS = [
-  %r{\A[A-Z]:\\Users\\[^\\]+\\}i,
-  %r{\A[A-Z]:\\Temp\\}i,
-  %r{\A[A-Z]:\\Windows\\Temp\\}i,
-  %r{\A[A-Z]:\\ProgramData\\}i
+# Directories that are user-writable on a stock Windows box. An executable
+# for a privileged task living under any of these = CRIT.
+USER_WRITABLE_PREFIXES = [
+  'C:\\Users\\',
+  'C:\\ProgramData\\',           # ACLs vary; often creatable by users
+  'C:\\Windows\\Temp\\',
+  'C:\\Temp\\'
 ].freeze
 
-def elevated?(t)
-  ELEVATED_PRINCIPALS.include?(t.run_as.to_s.upcase) || t.run_level == :highest
-end
+PRIVILEGED_PRINCIPALS = ['SYSTEM', 'NT AUTHORITY\\SYSTEM', 'LOCALSYSTEM',
+                         'ADMINISTRATORS', 'BUILTIN\\ADMINISTRATORS'].freeze
 
-def audit(tasks, stale_days: 30)
-  findings = []
-  now = Time.now
+TASK_LOGON_PASSWORD = 1     # TASK_LOGON_TYPE: stored username+password
+TASK_ACTION_EXEC    = 0     # TASK_ACTION_TYPE: launches an executable
 
-  tasks.each do |t|
-    exe = t.action_exe.to_s
+# --- pure classification logic (no COM -- this is what the test stub hits) --
 
-    if elevated?(t) && WRITABLE_ROOTS.any? { |rx| exe.match?(rx) }
-      findings << { severity: :crit, code: "elevated-writable-path", task: t.path,
-                    detail: "runs as #{t.run_as} (#{t.run_level}) from user-writable path #{exe}" }
-    end
+module TaskAudit
+  module_function
 
-    if t.hidden && !t.path.start_with?('\\Microsoft\\')
-      findings << { severity: :warn, code: "hidden-task", task: t.path,
-                    detail: "task is hidden from the UI — legitimate software rarely needs this" }
-    end
+  # task: { name:, path:, enabled:, hidden:, principal:, logon_type:,
+  #         actions: [ { type:, exe:, args: } ], last_run: Time|nil }
+  def classify(task, stale_days: 90, now: Time.now)
+    findings = []
+    privileged = PRIVILEGED_PRINCIPALS.include?(task[:principal].to_s.upcase)
 
-    if t.enabled && t.exe_missing
-      findings << { severity: :warn, code: "missing-executable", task: t.path,
-                    detail: "enabled task points at #{exe}, which no longer exists" }
-    end
-
-    if t.enabled && t.last_result && t.last_result != 0 && t.last_result != 0x41303 # never yet run
-      findings << { severity: :warn, code: "failing-task", task: t.path,
-                    detail: format("last run returned 0x%08X", t.last_result) }
-    end
-
-    if t.enabled && t.last_run && (now - t.last_run) > stale_days * 86_400
-      findings << { severity: :warn, code: "stale-task", task: t.path,
-                    detail: "enabled but has not run in #{((now - t.last_run) / 86_400).to_i} days" }
-    end
-
-    if t.missed_runs.to_i > 3
-      findings << { severity: :warn, code: "missed-runs", task: t.path,
-                    detail: "#{t.missed_runs} missed runs — check its trigger conditions" }
-    end
-  end
-
-  findings
-end
-
-# --- collection (Windows only) ---------------------------------------------
-
-def collect_tasks(include_microsoft: false)
-  require "win32ole"
-  svc = WIN32OLE.new("Schedule.Service")
-  svc.Connect
-  out = []
-  walk = lambda do |folder|
-    folder.GetTasks(1).each do |task| # 1 = TASK_ENUM_HIDDEN
-      d = task.Definition
-      next if !include_microsoft && task.Path.start_with?('\\Microsoft\\')
-      exec_action = nil
-      d.Actions.each do |a|
-        if a.Type == 0 # TASK_ACTION_EXEC
-          exec_action = a
-          break
-        end
+    task[:actions].each do |a|
+      next unless a[:type] == TASK_ACTION_EXEC
+      exe = a[:exe].to_s.strip
+      next if exe.empty?
+      bare = exe.delete('"')                     # path with quotes stripped
+      if privileged && USER_WRITABLE_PREFIXES.any? { |p| bare.upcase.start_with?(p.upcase) }
+        findings << ['CRIT', 'writable-binary-dir',
+                     "#{task[:principal]} task runs #{bare} from a user-writable directory"]
       end
-      exe_path = exec_action ? exec_action.Path.to_s.gsub('"', "") : ""
-      # Expand %ENVVAR% references the way Task Scheduler will before checking existence.
-      expanded = exe_path.gsub(/%([^%]+)%/) { ENV[Regexp.last_match(1)] || Regexp.last_match(0) }
-      out << TaskInfo.new(
-        path: task.Path,
-        enabled: task.Enabled,
-        hidden: d.Settings.Hidden,
-        run_as: d.Principal.UserId.to_s,
-        run_level: d.Principal.RunLevel == 1 ? :highest : :limited,
-        action_exe: exe_path,
-        action_args: exec_action ? exec_action.Arguments.to_s : "",
-        last_result: task.LastTaskResult,
-        last_run: (task.LastRunTime rescue nil),
-        missed_runs: (task.NumberOfMissedRuns rescue 0),
-        exe_missing: !exe_path.empty? && !File.exist?(expanded)
-      )
+      if bare =~ /\\(Temp|AppData)\\/i
+        findings << ['CRIT', 'temp-path-binary', "executable under #{$1} directory: #{bare}"]
+      end
+      # Unquoted path containing spaces: Windows tries "C:\Program.exe" first.
+      if !exe.start_with?('"') && bare.include?(' ') && bare.downcase.end_with?('.exe')
+        findings << ['WARN', 'unquoted-spacey-path', "unquoted path with spaces: #{exe}"]
+      end
     end
-    folder.GetFolders(0).each { |f| walk.call(f) }
+
+    findings << ['WARN', 'hidden-task', 'task is hidden from the Task Scheduler UI'] if task[:hidden]
+    if task[:logon_type] == TASK_LOGON_PASSWORD
+      findings << ['WARN', 'stored-credentials', 'task stores a password for its run-as account']
+    end
+    if task[:enabled] && task[:last_run] && (now - task[:last_run]) > stale_days * 86_400
+      days = ((now - task[:last_run]) / 86_400).to_i
+      findings << ['INFO', 'stale-task', "enabled but last ran #{days} days ago"]
+    end
+
+    findings.map { |sev, code, detail| { severity: sev, code: code, task: task[:path], detail: detail } }
+  end
+end
+
+# --- COM collection (Windows only) -----------------------------------------
+
+def collect_tasks
+  require 'win32ole'
+  svc = WIN32OLE.new('Schedule.Service')
+  svc.Connect
+  tasks = []
+  walk = lambda do |folder|
+    folder.GetTasks(1).each do |t|            # 1 = TASK_ENUM_HIDDEN: include hidden
+      dfn = t.Definition
+      actions = []
+      dfn.Actions.each do |a|
+        actions << if a.Type == TASK_ACTION_EXEC
+                     { type: TASK_ACTION_EXEC, exe: a.Path.to_s, args: (a.Arguments.to_s rescue '') }
+                   else
+                     { type: a.Type }
+                   end
+      end
+      last_run = begin
+        lr = t.LastRunTime
+        lr.respond_to?(:year) && lr.year > 1999 ? Time.parse(lr.to_s) : nil
+      rescue StandardError
+        nil
+      end
+      tasks << { name: t.Name, path: t.Path, enabled: t.Enabled,
+                 hidden: dfn.Settings.Hidden,
+                 principal: dfn.Principal.UserId.to_s,
+                 logon_type: dfn.Principal.LogonType,
+                 actions: actions, last_run: last_run }
+    end
+    folder.GetFolders(0).each { |sub| walk.call(sub) }
   end
   walk.call(svc.GetFolder('\\'))
-  out
+  tasks
 end
 
-# --- CLI -------------------------------------------------------------------
+# --- main ------------------------------------------------------------------
 
-if $PROGRAM_NAME == __FILE__
-  options = { json: false, all: false, stale_days: 30 }
+if __FILE__ == $PROGRAM_NAME
+  options = { json: false, stale: 90 }
   OptionParser.new do |o|
-    o.banner = "Usage: ruby scheduled_task_audit.rb [options]  (Windows)"
-    o.on("--json", "Emit JSON") { options[:json] = true }
-    o.on("--all", "Include \\Microsoft\\* tasks (noisy)") { options[:all] = true }
-    o.on("--stale-days N", Integer, "Enabled-but-not-running threshold (default 30)") { |v| options[:stale_days] = v }
+    o.banner = 'Usage: ruby scheduled_task_audit.rb [options]   (run elevated, on Windows)'
+    o.on('--json', 'JSON output') { options[:json] = true }
+    o.on('--stale DAYS', Integer, 'stale-task threshold (default 90)') { |v| options[:stale] = v }
   end.parse!
 
   begin
-    tasks = collect_tasks(include_microsoft: options[:all])
+    tasks = collect_tasks
   rescue LoadError
-    abort "win32ole not available — this collector only runs on Windows. " \
-          "The audit rules themselves are testable anywhere: see test_scheduled_task_audit.rb"
+    abort 'error: win32ole not available -- this script must run on Windows. ' \
+          'On other platforms, run scheduled_task_audit_test.rb to exercise the logic.'
   end
 
-  findings = audit(tasks, stale_days: options[:stale_days])
-  sev_rank = { crit: 2, warn: 1 }
-  findings.sort_by! { |f| -sev_rank[f[:severity]] }
-  exit_code = findings.any? { |f| f[:severity] == :crit } ? 2 : (findings.empty? ? 0 : 1)
+  findings = tasks.flat_map { |t| TaskAudit.classify(t, stale_days: options[:stale]) }
+  sev_rank = { 'CRIT' => 0, 'WARN' => 1, 'INFO' => 2 }
+  findings.sort_by! { |f| sev_rank[f[:severity]] }
+  crit = findings.count { |f| f[:severity] == 'CRIT' }
+  warn = findings.count { |f| f[:severity] == 'WARN' }
 
   if options[:json]
-    puts JSON.pretty_generate(
-      "generated_at" => Time.now.utc.iso8601,
-      "tasks_scanned" => tasks.size,
-      "findings" => findings.map { |f| f.transform_keys(&:to_s).tap { |h| h["severity"] = h["severity"].to_s } },
-      "exit_code" => exit_code
-    )
+    puts JSON.pretty_generate('tasks_scanned' => tasks.size,
+                              'findings' => findings.map { |f| f.transform_keys(&:to_s) },
+                              'summary' => { 'crit' => crit, 'warn' => warn,
+                                             'info' => findings.size - crit - warn })
   else
-    puts "scheduled_task_audit: #{tasks.size} tasks scanned"
+    puts "scheduled task audit -- #{tasks.size} tasks scanned"
+    puts
     if findings.empty?
-      puts "no findings — clean."
+      puts 'no findings -- clean.'
     else
-      findings.each { |f| puts format("%-4s %-24s %-40s %s", f[:severity].to_s.upcase, f[:code], f[:task], f[:detail]) }
-      puts "#{findings.count { |f| f[:severity] == :crit }} CRIT, #{findings.count { |f| f[:severity] == :warn }} WARN"
+      findings.each do |f|
+        puts format('%-5s %-22s %-40s %s', f[:severity], f[:code], f[:task], f[:detail])
+      end
+      puts
+      puts "#{crit} critical, #{warn} warning, #{findings.size - crit - warn} info"
     end
   end
-  exit exit_code
+  exit(crit.positive? ? 2 : warn.positive? ? 1 : 0)
 end

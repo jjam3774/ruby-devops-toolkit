@@ -1,95 +1,108 @@
 # scheduled-task-audit
 
-Audits Windows Scheduled Tasks via the Task Scheduler 2.0 COM API
-(`Schedule.Service` through stdlib `win32ole`) for persistence tricks and
-neglect: elevated tasks running from user-writable paths, hidden tasks,
-missing executables, chronic failures, stale jobs, and missed runs.
+Windows Scheduled Task security audit in Ruby, via the `Schedule.Service` COM API
+(the same interface `schtasks.exe` and `taskschd.msc` use). Walks the entire task
+tree and flags the patterns that show up in real privilege-escalation and
+persistence findings.
 
-Collection (COM) and analysis (pure Ruby) are deliberately separated, so the
-detection rules are fully unit-testable on any OS — see
-`test_scheduled_task_audit.rb` (12 tests, no Windows or COM required).
-
-![Architecture](img/scheduled_task_audit_flow.png)
+![architecture](img/task_audit_arch.png)
 
 ## Prerequisites
 
-- **Collector**: Windows + Ruby (RubyInstaller); `win32ole` ships with Ruby on
-  Windows. Run from an elevated prompt to see every task.
-- **Audit rules / tests**: any OS, plain Ruby.
+- **Windows** with Ruby that includes the `win32ole` standard library
+  (RubyInstaller builds do). No gems required.
+- Run from an **elevated** prompt so the COM API enumerates every task folder.
+- The pure classification logic is cross-platform and is exercised by the included
+  stub test harness, which runs on Linux/macOS.
 
 ## Usage
 
 ```powershell
-ruby scheduled_task_audit.rb            # text report, \Microsoft\* excluded
+# audit the local machine (run elevated)
+ruby scheduled_task_audit.rb
+
+# machine-readable
 ruby scheduled_task_audit.rb --json
-ruby scheduled_task_audit.rb --all      # include \Microsoft\* (noisy)
-ruby scheduled_task_audit.rb --stale-days 60
+
+# treat tasks idle for 180+ days as stale (default 90)
+ruby scheduled_task_audit.rb --stale 180
 ```
+
+Run the logic tests on any platform:
 
 ```bash
-ruby test_scheduled_task_audit.rb       # runs anywhere
+ruby scheduled_task_audit_test.rb
 ```
 
-Exit codes: `0` clean · `1` warnings · `2` criticals.
+## What it flags
+
+| Severity | Code | Meaning |
+|----------|------|---------|
+| CRIT | `writable-binary-dir` | Privileged (SYSTEM/admin) task whose executable lives in a user-writable directory — drop a same-named EXE and it runs as SYSTEM |
+| CRIT | `temp-path-binary` | Action executable under `\Temp\` or `\AppData\` — classic malware persistence spot |
+| WARN | `unquoted-spacey-path` | Executable path has spaces but no quotes (unquoted-service-path style ambiguity) |
+| WARN | `hidden-task` | Task is flagged hidden in the Task Scheduler UI |
+| WARN | `stored-credentials` | Task logs on with a stored password (logon type 1) |
+| INFO | `stale-task` | Enabled task that hasn't run in `--stale` days |
 
 ## How it works
 
-1. **Walk the tree over COM** — `WIN32OLE.new('Schedule.Service')` +
-   `Connect`; `GetTasks(1)` passes `TASK_ENUM_HIDDEN` so hidden tasks are
-   included; a recursive lambda descends every subfolder.
-2. **Flatten to `TaskInfo`** — each COM object becomes a plain Struct (path,
-   principal, run level, exec action, `LastTaskResult`, last run, missed runs,
-   and `exe_missing`, computed after expanding `%ENVVAR%` the way Task
-   Scheduler would). COM quirks stay in one function.
-3. **Audit rules** (pure functions):
-   - `elevated-writable-path` (CRIT) — SYSTEM / highest-runlevel task whose
-     binary lives under `C:\Users\...`, `C:\ProgramData\...` or temp dirs:
-     any local user can swap the binary and own the box at next trigger
-   - `hidden-task` — concealment outside `\Microsoft\`
-   - `missing-executable` — enabled task pointing at a deleted binary
-   - `failing-task` — nonzero `LastTaskResult` (0x41303 "not yet run" exempt)
-   - `stale-task` — enabled but silent past `--stale-days`
-   - `missed-runs` — more than 3 missed runs
+The script is deliberately split into two layers:
 
-## Example findings (fixture fleet)
+1. **COM collection (`collect_tasks`, Windows-only).** Connects to
+   `Schedule.Service`, walks from the root folder recursively, calls `GetTasks(1)`
+   to include hidden tasks, and normalizes each task into a plain Ruby hash:
+   principal, logon type, hidden/enabled flags, action executables, and last run time.
+2. **Pure classification (`TaskAudit.classify`).** Takes that hash and returns the
+   findings — no COM, no I/O. Because it's pure, it can be unit-tested anywhere.
+
+`collect_tasks` requires `win32ole` lazily, so on a non-Windows box the main script
+exits with a clear message instead of a stack trace, and points you at the test harness.
+
+## Example output (stub harness)
 
 ```
-scheduled_task_audit: 4 tasks scanned
-CRIT elevated-writable-path   \updater                 runs as SYSTEM (highest) from user-writable path C:\Users\bob\AppData\Local\updater\updater.exe
-WARN hidden-task              \Adobe\telemetry-helper  task is hidden from the UI — legitimate software rarely needs this
-WARN missing-executable       \MyCorp\log-ship         enabled task points at C:\Tools\logship.exe, which no longer exists
-WARN failing-task             \MyCorp\log-ship         last run returned 0x80070002
-1 CRIT, 5 WARN
+PASS  clean system task
+PASS  SYSTEM task with exe in user-writable dir
+PASS  exe under AppData flags temp-path-binary
+PASS  SYSTEM + Windows\Temp flags both CRITs
+PASS  unquoted path with spaces
+PASS  hidden task
+PASS  stored credentials (logon type 1)
+PASS  stale enabled task
+...
+all tests passed
 ```
 
-## Testing notes (honest ones)
-
-The audit rules were verified with the bundled minitest fixtures on Linux
-(12 runs, 24 assertions, 0 failures). The COM collector follows the documented
-Task Scheduler 2.0 API but requires a real Windows host — run it on one before
-trusting fleet numbers.
+On a real Windows host, `scheduled_task_audit.rb` prints a severity-ranked table of
+findings across all task folders and exits `2`/`1`/`0` for CRIT/WARN/clean.
 
 ## Troubleshooting
 
-- **`WIN32OLERuntimeError` on Connect** — Task Scheduler service stopped or a
-  stripped container image; check `sc query schedule`.
-- **Fewer tasks than the UI** — you're not elevated.
-- **ProgramData false positives** — the path heuristic can't see ACLs; some
-  vendors lock their subfolder down correctly. Verify with `icacls`, or extend
-  the script to query ACLs.
+- **`win32ole not available`** — you're not on Windows (or on a Ruby build without it).
+  The detection logic is still fully testable via `scheduled_task_audit_test.rb`.
+- **Fewer tasks than `taskschd.msc` shows** — you're not elevated; some folders
+  (e.g. `\Microsoft\Windows\...`) won't enumerate without admin rights.
+- **`writable-binary-dir` false positives on ProgramData** — ACLs on `C:\ProgramData`
+  vary; confirm the actual directory ACL with `icacls` before treating it as exploitable.
+- **No `last_run` / stale never fires** — tasks that have never run report a placeholder
+  1899/1999 timestamp, which the script treats as "never ran" rather than stale.
+
+> **Note on testing honesty:** the COM enumeration path depends on WMI/Task Scheduler and
+> can only run on a real Windows host, so it is *not* executed in CI here. What **is**
+> verified — on Linux, via the stub harness — is every CRIT/WARN/INFO decision, using
+> realistic task fixtures fed straight into `TaskAudit.classify`.
 
 ## Extending
 
-- Replace the writable-root heuristic with real ACL checks (`icacls` / WMI)
-  for write access by `BUILTIN\Users`.
-- Baseline diffing: alert only on *new* tasks — fresh persistence is the
-  highest-signal event on a box.
-- Surface at-logon / at-startup triggers.
-- Fleet rollup over WinRM; aggregate JSON by finding code.
+- Resolve and check the real NTFS ACL of each binary directory instead of matching
+  path prefixes, for a definitive writable-dir verdict.
+- Parse action `Arguments` for suspicious `-enc`/`DownloadString` PowerShell patterns.
+- Emit findings as JSON to a SIEM, or wire into a scheduled compliance job that mails on CRIT.
+- Add allowlisting for known-good vendor tasks that legitimately live under AppData.
 
 ## References
 
-- Blog post: https://tha-shed.com/ (Ruby for DevOps series)
-- Task Scheduler 2.0 API: https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-start-page
-- Ruby stdlib `WIN32OLE`: https://docs.ruby-lang.org/en/3.3/WIN32OLE.html
-- MITRE ATT&CK T1053.005 (Scheduled Task): https://attack.mitre.org/techniques/T1053/005/
+- [Task Scheduler Scripting Objects (`Schedule.Service`)](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-scripting-objects)
+- [`TASK_LOGON_TYPE` enumeration](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/ne-taskschd-task_logon_type)
+- [Ruby `WIN32OLE`](https://docs.ruby-lang.org/en/3.4/WIN32OLE.html)
