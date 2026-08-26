@@ -1,97 +1,87 @@
 # disk-usage-report
 
-Answers "**what is eating this disk?**" in one pass of standard-library Ruby.
-Combines the three views a sysadmin usually assembles by hand from `df`, `du`
-and `find`: filesystem fill levels with warn/crit thresholds, the heaviest
-directories under a scan root, and the largest / stalest files.
+Disk usage reporting and growth tracking for Linux/macOS in one stdlib-only Ruby
+script. Answers the two questions `df` can't: **where** the bytes live, and
+**where they grew** since the last run.
 
-![one walk, three views](img/disk_usage_flow.png)
+![Data flow](img/disk_usage_flow.png)
 
 ## Prerequisites
 
-- Ruby 2.7+ (tested on 3.0) — standard library only (`find`, `optparse`, `json`)
-- Linux/macOS with a POSIX `df` in `PATH`
-- Read access to the trees you scan (unreadable entries are counted and skipped,
-  not fatal)
+- Ruby 2.7+ (tested on 3.0) — stock distro package is fine
+- Standard library only: `find`, `json`, `optparse`, `time` — no gems
+- Read access to the trees you scan (unreadable paths are counted, not fatal)
 
 ## Usage
 
 ```bash
-# what's eating /var/log?
-ruby disk_usage_report.rb /var/log
-
-# top 10 offenders, stale = untouched 90+ days, alert thresholds 80/90%
-ruby disk_usage_report.rb --top 10 --stale-days 90 --warn 80 --crit 90 /srv
-
-# monitoring pipeline
-ruby disk_usage_report.rb --json /var/log | jq '.scans[0].stale_total_bytes'
+ruby disk_usage_report.rb /var /home                    # human-readable report
+ruby disk_usage_report.rb --top 15 --min-file-mb 250 /var
+ruby disk_usage_report.rb --json /var                   # machine-readable
+ruby disk_usage_report.rb --save-snapshot /var/tmp/du.json /var
+ruby disk_usage_report.rb --compare /var/tmp/du.json /var
+ruby disk_usage_report.rb --warn-gb 80 /var             # exit 1 over threshold
 ```
 
-Exit codes: `0` all filesystems under `--warn`, `1` over warn, `2` over crit —
-so the same script doubles as a Nagios-style disk check.
+Exit codes: `0` ok · `1` a `--warn-gb` threshold was breached · `2` usage error.
 
 ## How it works
 
-- **`df -P -k`**, not plain `df`: the POSIX flag guarantees one line per
-  filesystem with stable columns, which makes parsing safe. Bind mounts are
-  deduplicated by device name (first mount wins).
-- **One `Find.find` walk** per scan root. For every regular file, its size is
-  *billed upward* to every ancestor directory up to the scan root. That yields
-  cumulative directory totals — what `du -s` would report — while the same
-  pass also collects the largest-files and stale-files lists. No shelling out
-  to `du`, no second walk.
-- **`File.lstat`**, not `stat`, so symlinks are never followed — no loops, no
-  double-billing files that live elsewhere.
-- **Stale = mtime older than `--stale-days`**. Old + big = archive candidate;
-  the report totals the reclaimable bytes for you.
+1. **One walk** — `Find.find` streams every path; `File.lstat` (never `stat`)
+   means symlinks are skipped entirely, so link loops can't hang the scan and
+   links can't double-count. Permission errors increment a counter instead of
+   crashing.
+2. **Attribution** — each file's bytes are credited to the scanned root's
+   *immediate child directory* (files directly in the root go to a synthetic
+   `<root files>` bucket), which is what makes the output read "log holds 50.9%"
+   instead of being a raw directory dump. Files ≥ `--min-file-mb` (default
+   100 MiB) also enter a global big-file top-N with mtimes.
+3. **Snapshots** — `--save-snapshot` writes per-child totals + UTC timestamp as
+   JSON; `--compare` unions the keys, subtracts bucket by bucket, and prints
+   non-zero deltas sorted by growth (negatives are reported as freed).
+4. **Exit codes** — `--warn-gb` turns the report into a cron-able monitor.
 
 ## Example output
 
 ```
-$ ruby disk_usage_report.rb --top 5 --stale-days 60 --warn 80 --crit 90 /tmp/srv-data
-== Filesystems ==
-[ OK ] /dev/sda1                    /                   5.7 GB used of 9.5 GB    (60%)
-[ OK ] /dev/sdc                     /sessions           3.4 GB used of 9.7 GB    (37%)
+== /tmp/demo/var  (total 1.0 GiB, 0 unreadable)
+-- largest immediate subdirectories:
+   540.0 MiB   50.9%  log
+   460.0 MiB   43.4%  lib
+    60.0 MiB    5.7%  cache
+-- largest files (>= 100 MiB):
+   420.0 MiB  2026-08-26  /tmp/demo/var/log/app/app.log
+   310.0 MiB  2026-08-26  /tmp/demo/var/lib/docker/overlay.img
 
-== /tmp/srv-data -- 46.3 MB in 6 files ==
--- heaviest directories (cumulative) --
-     46.3 MB  /tmp/srv-data
-     25.7 MB  /tmp/srv-data/db
-     25.7 MB  /tmp/srv-data/db/backups
-     20.5 MB  /tmp/srv-data/app
-     12.4 MB  /tmp/srv-data/app/logs
--- largest files --
-     14.3 MB  /tmp/srv-data/db/backups/db_2026-05-01.sql.gz  (modified 2026-05-01)
-     11.4 MB  /tmp/srv-data/db/backups/db_2026-08-24.sql.gz  (modified 2026-08-25)
-      8.6 MB  /tmp/srv-data/app/logs/app.log  (modified 2026-08-25)
--- stale files (untouched > 60 days, top 5 by size) --
-     14.3 MB  /tmp/srv-data/db/backups/db_2026-05-01.sql.gz  (modified 2026-05-01)
-      5.7 MB  /tmp/srv-data/app/cache/assets.bin  (modified 2026-04-10)
-  reclaimable if archived: 20.0 MB across 2 stale files
+== growth for /tmp/demo/var since 2026-08-26T16:37:30Z: +390.0 MiB
+    +240.0 MiB  log
+    +150.0 MiB  lib
 ```
 
 ## Troubleshooting
 
-- **Numbers differ slightly from `du`** — `du` reports *allocated blocks*
-  (sparse files, block rounding); this script reports *apparent size*
-  (`stat.size`). Both are "right"; know which one you want.
-- **Scan is slow on huge trees** — it's one full walk; on multi-million-file
-  trees run it against subtrees, or via `nice`/`ionice` from cron.
-- **Permission noise** — unreadable files/dirs are skipped and counted in the
-  `unreadable` figure rather than aborting the scan.
-- **`df` shows a filesystem you don't care about** — dedupe keeps the first
-  mount per device; squashfs/loop devices can be filtered by extending
-  `filesystems`.
+- **Totals differ from `du`** — expected: `du` reports allocated blocks and
+  counts hard links once; this sums apparent sizes via `lstat`. Sparse files
+  and hard-link farms widen the gap.
+- **Large "unreadable" count** — you're not root; re-run with `sudo` or accept
+  the partial view (the counter tells you how partial).
+- **Scan crosses mounts** — the walk descends into anything under the root,
+  including `/proc` or NFS if you scan `/`. Scan specific trees, or add a
+  device-boundary check (below).
+- **Compare shows nothing after moving files** — moves within the same
+  top-level bucket are invisible by design.
 
-## Extending it
+## Extending
 
-- `--min-size` floor so tiny files never clutter the lists
-- Trend mode: write each run's JSON to disk and diff growth run-over-run
-- An `--exclude PATTERN` list for cache/venv directories
-- Wire exit codes into Nagios/Icinga or a systemd timer + OnFailure alert
+- Stay on one filesystem: remember `File.lstat(root).dev` and `Find.prune` on
+  directories whose `dev` differs (`du -x` behaviour).
+- Rank cleanup candidates by `size × age` using the big-file mtimes.
+- Ship `--json` to a metrics pipeline; keep nightly snapshots per host.
+- Add a second attribution level (`log/app`) for very large trees.
 
 ## References
 
-- [Ruby Find module docs](https://docs.ruby-lang.org/en/3.0/Find.html)
-- [POSIX df specification](https://pubs.opengroup.org/onlinepubs/9699919799/utilities/df.html)
 - Blog post: https://tha-shed.com/ (Ruby for DevOps series)
+- Ruby stdlib `Find`: https://docs.ruby-lang.org/en/3.3/Find.html
+- Ruby stdlib `File::Stat`: https://docs.ruby-lang.org/en/3.3/File/Stat.html
+- GNU coreutils `du`: https://www.gnu.org/software/coreutils/manual/html_node/du-invocation.html

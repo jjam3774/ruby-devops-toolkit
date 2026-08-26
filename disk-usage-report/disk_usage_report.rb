@@ -1,169 +1,199 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #
-# disk_usage_report.rb -- answer "what is eating this disk?" in one pass.
+# disk_usage_report.rb — disk usage reporting and growth tracking for Linux/macOS.
 #
-# Combines three views a sysadmin usually assembles by hand from df, du and
-# find:
+# Walks one or more directory trees, reports the biggest immediate
+# subdirectories and the biggest individual files, and (optionally) compares
+# the current scan against a saved JSON snapshot so you can see exactly WHERE
+# a filesystem grew since the last run — the question `df` can never answer.
 #
-#   1. Filesystem fill levels (parsed from `df -P`, the POSIX-stable format),
-#      flagged against warn/crit thresholds.
-#   2. The heaviest directories under a scan root -- computed from ONE
-#      recursive walk, sizes aggregated bottom-up, no shelling out to du.
-#   3. The largest and stalest files (old + big = archive candidates).
-#
-# Standard library only. Text or --json output, cron-friendly exit codes:
-#   0 = all filesystems under warn threshold
-#   1 = at least one filesystem over --warn %
-#   2 = at least one filesystem over --crit %
+# Stdlib only: find, json, optparse, etc. No gems.
 #
 # Usage:
-#   ruby disk_usage_report.rb /var/log
-#   ruby disk_usage_report.rb --top 10 --stale-days 90 --warn 80 --crit 90 /srv
-#   ruby disk_usage_report.rb --json /var/log | jq .
+#   ruby disk_usage_report.rb /var /home                 # human-readable report
+#   ruby disk_usage_report.rb --top 15 /var              # more rows
+#   ruby disk_usage_report.rb --json /var                # machine-readable
+#   ruby disk_usage_report.rb --save-snapshot /var/tmp/du.json /var
+#   ruby disk_usage_report.rb --compare /var/tmp/du.json /var
+#   ruby disk_usage_report.rb --warn-gb 50 /var          # exit 1 if a root exceeds 50 GiB
 #
-require 'optparse'
-require 'json'
-require 'find'
-require 'time'
+# Exit codes: 0 = ok, 1 = a --warn-gb threshold was exceeded, 2 = usage error.
 
-opts = { top: 8, stale_days: 30, warn: 80, crit: 90, json: false }
+require "find"
+require "json"
+require "optparse"
+require "time"
+
+options = {
+  top: 10,
+  json: false,
+  save_snapshot: nil,
+  compare: nil,
+  warn_gb: nil,
+  min_file_mb: 100 # only individual files at least this big make the "big files" table
+}
+
 parser = OptionParser.new do |o|
-  o.banner = 'Usage: disk_usage_report.rb [options] SCAN_ROOT [SCAN_ROOT...]'
-  o.on('--top N', Integer, 'How many heaviest dirs/files to show (default 8)') { |v| opts[:top] = v }
-  o.on('--stale-days N', Integer, 'Files not modified in N days are stale (default 30)') { |v| opts[:stale_days] = v }
-  o.on('--warn PCT', Integer, 'Filesystem WARN threshold %% (default 80)') { |v| opts[:warn] = v }
-  o.on('--crit PCT', Integer, 'Filesystem CRIT threshold %% (default 90)') { |v| opts[:crit] = v }
-  o.on('--json', 'Emit JSON instead of text') { opts[:json] = true }
+  o.banner = "Usage: ruby disk_usage_report.rb [options] DIR [DIR...]"
+  o.on("--top N", Integer, "Rows per table (default 10)") { |v| options[:top] = v }
+  o.on("--json", "Emit JSON instead of text") { options[:json] = true }
+  o.on("--save-snapshot FILE", "Write scan results to FILE for later --compare") { |v| options[:save_snapshot] = v }
+  o.on("--compare FILE", "Diff this scan against a snapshot produced by --save-snapshot") { |v| options[:compare] = v }
+  o.on("--warn-gb N", Float, "Exit 1 if any scanned root exceeds N GiB") { |v| options[:warn_gb] = v }
+  o.on("--min-file-mb N", Integer, "Big-file table cutoff in MiB (default 100)") { |v| options[:min_file_mb] = v }
 end
-parser.parse!(ARGV)
+parser.parse!
+
 roots = ARGV
-abort(parser.to_s) if roots.empty?
+if roots.empty?
+  warn parser.banner
+  exit 2
+end
+
+# ---------------------------------------------------------------------------
+# Scanning.
+#
+# For each root we account every regular file's size (lstat — we never follow
+# symlinks, so a link farm can't double-count or loop us) into:
+#   * the root's total
+#   * the root's immediate child directory that contains it
+# and we keep a global top-N list of the largest individual files.
+# ---------------------------------------------------------------------------
 
 def human(bytes)
-  units = %w[B KB MB GB TB]
-  size = bytes.to_f
-  unit = 0
-  while size >= 1024 && unit < units.size - 1
-    size /= 1024
-    unit += 1
-  end
-  format(unit.zero? ? '%d %s' : '%.1f %s', size, units[unit])
+  units = %w[B KiB MiB GiB TiB]
+  return "0 B" if bytes.zero?
+  exp = [(Math.log(bytes) / Math.log(1024)).floor, units.size - 1].min
+  format("%.1f %s", bytes.to_f / (1024**exp), units[exp])
 end
 
-# ---------------------------------------------------------------------------
-# 1. Filesystem fill levels via `df -P` (POSIX output: stable columns, one
-#    line per filesystem -- safe to parse, unlike the default GNU format).
-# ---------------------------------------------------------------------------
-def filesystems
-  out = `df -P -k 2>/dev/null`
-  seen = {} # dedupe bind mounts: same device listed once, first mount wins
-  out.lines.drop(1).filter_map do |line|
-    cols = line.split
-    next if cols.size < 6
-    dev, blocks, used, avail, pct, mount = cols[0], cols[1].to_i, cols[2].to_i, cols[3].to_i, cols[4].delete('%').to_i, cols[5..].join(' ')
-    next if dev == 'tmpfs' || dev == 'none' || blocks.zero?
-    next if seen[dev]
-    seen[dev] = true
-    { device: dev, mount: mount, size_kb: blocks, used_kb: used, avail_kb: avail, used_pct: pct }
-  end
-end
-
-# ---------------------------------------------------------------------------
-# 2 + 3. One recursive walk per root. For every file we bill its size to every
-# ancestor directory up to the root, so directory totals are cumulative --
-# what `du -s` would report -- but from a single pass that also collects the
-# largest/stalest file lists at the same time.
-# ---------------------------------------------------------------------------
-def scan(root, stale_before)
-  dir_sizes = Hash.new(0)
-  files = []
-  errors = 0
-  root = File.expand_path(root)
+def scan_root(root, min_file_bytes)
+  totals   = Hash.new(0)  # immediate-child dir (or "<root files>") => bytes
+  big      = []           # [path, bytes, mtime]
+  errors   = 0
+  total    = 0
+  root     = File.expand_path(root)
+  prefix   = root.end_with?("/") ? root : "#{root}/"
 
   Find.find(root) do |path|
     begin
-      stat = File.lstat(path)
-    rescue Errno::ENOENT, Errno::EACCES
+      st = File.lstat(path)
+    rescue SystemCallError
       errors += 1
       next
     end
-    if stat.directory?
-      dir_sizes[path] += 0 # make empty dirs visible
-    elsif stat.file?
-      files << { path: path, bytes: stat.size, mtime: stat.mtime }
-      # bill the file to every ancestor up to (and including) the root
-      dir = File.dirname(path)
-      while dir.start_with?(root)
-        dir_sizes[dir] += stat.size
-        break if dir == root
-        dir = File.dirname(dir)
-      end
+    # Don't descend into other mounted filesystems' mountpoints? Keeping it
+    # simple: we do descend, but we skip symlinks entirely.
+    if st.symlink?
+      Find.prune if st.ftype == "directory" rescue nil
+      next
     end
+    next unless st.file?
+
+    total += st.size
+    rel = path.delete_prefix(prefix)
+    child = rel.include?("/") ? rel.split("/", 2).first : "<root files>"
+    totals[child] += st.size
+    big << [path, st.size, st.mtime] if st.size >= min_file_bytes
+  rescue SystemCallError
+    errors += 1
   end
 
-  stale = files.select { |f| f[:mtime] < stale_before }
-  { root: root, dir_sizes: dir_sizes, files: files, stale: stale, errors: errors }
+  big.sort_by! { |(_, sz, _)| -sz }
+  { root: root, total_bytes: total, children: totals, big_files: big, stat_errors: errors }
 end
 
-stale_before = Time.now - opts[:stale_days] * 86_400
-fs = filesystems
-worst = fs.map { |f| f[:used_pct] }.max || 0
-exit_code = worst >= opts[:crit] ? 2 : (worst >= opts[:warn] ? 1 : 0)
+min_file_bytes = options[:min_file_mb] * 1024 * 1024
+scans = roots.map { |r| scan_root(r, min_file_bytes) }
 
-reports = roots.map { |r| scan(r, stale_before) }
+# ---------------------------------------------------------------------------
+# Snapshot save / compare.
+#
+# A snapshot is just the per-child byte totals keyed by root. Comparing two
+# snapshots turns "the disk filled up" into "var/log grew 9.2 GiB since
+# Tuesday", which is the actual question during an incident.
+# ---------------------------------------------------------------------------
 
-if opts[:json]
-  payload = {
-    generated_at: Time.now.utc.iso8601,
-    thresholds: { warn_pct: opts[:warn], crit_pct: opts[:crit] },
-    filesystems: fs,
-    scans: reports.map do |rep|
-      {
-        root: rep[:root],
-        total_bytes: rep[:dir_sizes][rep[:root]] || 0,
-        file_count: rep[:files].size,
-        unreadable: rep[:errors],
-        heaviest_dirs: rep[:dir_sizes].sort_by { |_, v| -v }.first(opts[:top])
-                          .map { |d, b| { dir: d, bytes: b } },
-        largest_files: rep[:files].max_by(opts[:top]) { |f| f[:bytes] }
-                          .map { |f| { path: f[:path], bytes: f[:bytes], mtime: f[:mtime].utc.iso8601 } },
-        stale_files: rep[:stale].sort_by { |f| -f[:bytes] }.first(opts[:top])
-                          .map { |f| { path: f[:path], bytes: f[:bytes], mtime: f[:mtime].utc.iso8601 } },
-        stale_total_bytes: rep[:stale].sum { |f| f[:bytes] }
-      }
-    end
+if options[:save_snapshot]
+  snap = {
+    "taken_at" => Time.now.utc.iso8601,
+    "roots" => scans.to_h { |s| [s[:root], { "total_bytes" => s[:total_bytes], "children" => s[:children] }] }
   }
-  puts JSON.pretty_generate(payload)
-else
-  puts '== Filesystems =='
-  fs.each do |f|
-    badge = f[:used_pct] >= opts[:crit] ? '[CRIT]' : (f[:used_pct] >= opts[:warn] ? '[WARN]' : '[ OK ]')
-    puts format('%s %-28s %-16s %9s used of %-9s (%d%%)',
-                badge, f[:device], f[:mount], human(f[:used_kb] * 1024), human(f[:size_kb] * 1024), f[:used_pct])
-  end
-  reports.each do |rep|
-    total = rep[:dir_sizes][rep[:root]] || 0
-    puts
-    puts "== #{rep[:root]} -- #{human(total)} in #{rep[:files].size} files" \
-         "#{rep[:errors] > 0 ? " (#{rep[:errors]} unreadable, skipped)" : ''} =="
-    puts "-- heaviest directories (cumulative) --"
-    rep[:dir_sizes].sort_by { |_, v| -v }.first(opts[:top]).each do |dir, bytes|
-      puts format('  %10s  %s', human(bytes), dir)
+  File.write(options[:save_snapshot], JSON.pretty_generate(snap))
+end
+
+growth = nil
+if options[:compare]
+  old = JSON.parse(File.read(options[:compare]))
+  growth = {}
+  scans.each do |s|
+    prev = old.dig("roots", s[:root]) or next
+    deltas = {}
+    keys = (s[:children].keys | prev["children"].keys)
+    keys.each do |k|
+      d = s[:children][k].to_i - prev["children"][k].to_i
+      deltas[k] = d unless d.zero?
     end
-    puts "-- largest files --"
-    rep[:files].max_by(opts[:top]) { |f| f[:bytes] }.each do |f|
-      puts format('  %10s  %s  (modified %s)', human(f[:bytes]), f[:path], f[:mtime].strftime('%Y-%m-%d'))
-    end
-    unless rep[:stale].empty?
-      puts "-- stale files (untouched > #{opts[:stale_days]} days, top #{opts[:top]} by size) --"
-      rep[:stale].sort_by { |f| -f[:bytes] }.first(opts[:top]).each do |f|
-        puts format('  %10s  %s  (modified %s)', human(f[:bytes]), f[:path], f[:mtime].strftime('%Y-%m-%d'))
-      end
-      puts format('  reclaimable if archived: %s across %d stale files',
-                  human(rep[:stale].sum { |f| f[:bytes] }), rep[:stale].size)
-    end
+    growth[s[:root]] = {
+      since: old["taken_at"],
+      total_delta: s[:total_bytes] - prev["total_bytes"].to_i,
+      children: deltas.sort_by { |_, d| -d }
+    }
   end
 end
 
-exit exit_code
+# ---------------------------------------------------------------------------
+# Threshold + output.
+# ---------------------------------------------------------------------------
+
+breaches = []
+if options[:warn_gb]
+  limit = (options[:warn_gb] * 1024**3).to_i
+  scans.each { |s| breaches << s[:root] if s[:total_bytes] > limit }
+end
+
+if options[:json]
+  out = {
+    "generated_at" => Time.now.utc.iso8601,
+    "roots" => scans.map do |s|
+      {
+        "root" => s[:root],
+        "total_bytes" => s[:total_bytes],
+        "stat_errors" => s[:stat_errors],
+        "top_children" => s[:children].sort_by { |_, b| -b }.first(options[:top]).map { |n, b| { "name" => n, "bytes" => b } },
+        "big_files" => s[:big_files].first(options[:top]).map { |p, b, m| { "path" => p, "bytes" => b, "mtime" => m.utc.iso8601 } }
+      }
+    end,
+    "growth" => growth&.transform_values { |g| { "since" => g[:since], "total_delta" => g[:total_delta], "children" => g[:children].to_h } },
+    "warn_breaches" => breaches
+  }
+  puts JSON.pretty_generate(out)
+else
+  scans.each do |s|
+    puts "== #{s[:root]}  (total #{human(s[:total_bytes])}, #{s[:stat_errors]} unreadable)"
+    puts "-- largest immediate subdirectories:"
+    s[:children].sort_by { |_, b| -b }.first(options[:top]).each do |name, bytes|
+      pct = s[:total_bytes].zero? ? 0 : bytes * 100.0 / s[:total_bytes]
+      puts format("   %9s  %5.1f%%  %s", human(bytes), pct, name)
+    end
+    top_files = s[:big_files].first(options[:top])
+    unless top_files.empty?
+      puts "-- largest files (>= #{options[:min_file_mb]} MiB):"
+      top_files.each { |p, b, m| puts format("   %9s  %s  %s", human(b), m.strftime("%Y-%m-%d"), p) }
+    end
+    puts
+  end
+
+  growth&.each do |root, g|
+    puts "== growth for #{root} since #{g[:since]}: #{g[:total_delta] >= 0 ? '+' : ''}#{human(g[:total_delta].abs)}#{g[:total_delta].negative? ? ' freed' : ''}"
+    g[:children].first(options[:top]).each do |name, d|
+      puts format("   %+11s  %s", (d >= 0 ? "+" : "-") + human(d.abs), name)
+    end
+    puts
+  end
+
+  breaches.each { |r| puts "WARN: #{r} exceeds --warn-gb #{options[:warn_gb]} threshold" }
+end
+
+exit(breaches.empty? ? 0 : 1)
