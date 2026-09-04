@@ -1,97 +1,124 @@
 # disk-usage-report
 
-Answers "**what is eating this disk?**" in one pass of standard-library Ruby.
-Combines the three views a sysadmin usually assembles by hand from `df`, `du`
-and `find`: filesystem fill levels with warn/crit thresholds, the heaviest
-directories under a scan root, and the largest / stalest files.
+Answer "where did the disk go?" with one Ruby script: a `du`-style rollup of the
+largest subdirectories, the largest individual files, stale heavyweights nobody
+has touched in months, filesystem capacity with warn/crit thresholds for cron,
+and JSON snapshots so a later run can tell you exactly which directories grew.
 
-![one walk, three views](img/disk_usage_flow.png)
+One `Find.find` pass fills three accumulators; `df -kP` adds capacity; snapshots
+make growth diffable:
+
+![architecture](img/disk_usage_flow.png)
 
 ## Prerequisites
 
-- Ruby 2.7+ (tested on 3.0) — standard library only (`find`, `optparse`, `json`)
-- Linux/macOS with a POSIX `df` in `PATH`
-- Read access to the trees you scan (unreadable entries are counted and skipped,
-  not fatal)
+- Ruby >= 2.7 (tested on 3.0) — standard library only, no gems
+- Linux or macOS for the `df -kP` capacity check (the tree walker itself is pure
+  Ruby and runs anywhere; without a POSIX `df` you just lose the use% gate)
 
 ## Usage
 
 ```bash
-# what's eating /var/log?
-ruby disk_usage_report.rb /var/log
+# Top offenders under /var and /home, stale files older than 180 days
+ruby disk_usage_report.rb /var /home --top 10 --stale-days 180
 
-# top 10 offenders, stale = untouched 90+ days, alert thresholds 80/90%
-ruby disk_usage_report.rb --top 10 --stale-days 90 --warn 80 --crit 90 /srv
+# Nightly cron: page when the filesystem crosses 90%
+ruby disk_usage_report.rb /data --warn-pct 80 --crit-pct 90
 
-# monitoring pipeline
-ruby disk_usage_report.rb --json /var/log | jq '.scans[0].stale_total_bytes'
+# Take a snapshot today...
+ruby disk_usage_report.rb /data --snapshot /var/tmp/du_snap.json
+
+# ...and diff against it tomorrow: "what grew overnight?"
+ruby disk_usage_report.rb /data --compare /var/tmp/du_snap.json
+
+# Machine-readable everything
+ruby disk_usage_report.rb /data --json | jq '.roots[].dirs'
 ```
 
-Exit codes: `0` all filesystems under `--warn`, `1` over warn, `2` over crit —
-so the same script doubles as a Nagios-style disk check.
+| Option | Meaning |
+| --- | --- |
+| `--top N` | largest files to list (default 15) |
+| `--dirs N` | top-level subdirectories to list (default 12) |
+| `--stale-days N` | age before a file counts as stale (default 90) |
+| `--stale-min-size BYTES` | minimum size for stale reporting (default 50 MiB) |
+| `--warn-pct N` / `--crit-pct N` | filesystem use% gates -> exit 1 / exit 2 |
+| `--snapshot FILE` / `--compare FILE` | write / diff per-directory totals as JSON |
+| `--json` | full report as JSON |
+
+Exit codes: `0` ok, `1` warn threshold breached, `2` crit threshold breached —
+drop it straight into cron or a Nagios-style check.
 
 ## How it works
 
-- **`df -P -k`**, not plain `df`: the POSIX flag guarantees one line per
-  filesystem with stable columns, which makes parsing safe. Bind mounts are
-  deduplicated by device name (first mount wins).
-- **One `Find.find` walk** per scan root. For every regular file, its size is
-  *billed upward* to every ancestor directory up to the scan root. That yields
-  cumulative directory totals — what `du -s` would report — while the same
-  pass also collects the largest-files and stale-files lists. No shelling out
-  to `du`, no second walk.
-- **`File.lstat`**, not `stat`, so symlinks are never followed — no loops, no
-  double-billing files that live elsewhere.
-- **Stale = mtime older than `--stale-days`**. Old + big = archive candidate;
-  the report totals the reclaimable bytes for you.
+- **One pass, three answers.** A single `Find.find` walk fills a `Hash.new(0)`
+  rollup keyed by top-level subdirectory, a bounded top-N list of largest files,
+  and a stale list (`mtime` older than the cutoff and size above the floor).
+  No second walk, no sorting millions of entries.
+- **`lstat`, not `stat`.** Symlinks count as themselves (a link to a 40 GB image
+  is a few bytes, not 40 GB) and symlink loops can't trap the walker.
+- **Errors are data.** Unreadable entries are counted and skipped; a disk report
+  that dies on the first `EACCES` is useless on a real box.
+- **Bounded top-N.** The candidate list is trimmed at 512 entries (sort, keep
+  64) so memory stays flat no matter how many files you scan.
+- **Capacity via `df -kP`.** POSIX-portable output, parsed from the last line;
+  `--warn-pct` / `--crit-pct` turn use% into exit codes.
+- **Snapshots are just JSON.** `{root -> {dir -> bytes}}` plus a timestamp.
+  `--compare` aligns old and new keys and prints the delta per directory —
+  usually the fastest possible answer to "what grew overnight?".
 
 ## Example output
 
 ```
-$ ruby disk_usage_report.rb --top 5 --stale-days 60 --warn 80 --crit 90 /tmp/srv-data
-== Filesystems ==
-[ OK ] /dev/sda1                    /                   5.7 GB used of 9.5 GB    (60%)
-[ OK ] /dev/sdc                     /sessions           3.4 GB used of 9.7 GB    (37%)
+== /tmp/dutest  [WARN]
+   total 17.0 MiB in 5 files
+   filesystem /dev/sda1 on /: 5.6 GiB used of 9.5 GiB (60%), 3.9 GiB free
+   -- largest subdirectories --
+      8.0 MiB  cache/
+      5.0 MiB  logs/
+      4.0 MiB  projects/
+      2.0 KiB  ./
+   -- largest files --
+      8.0 MiB  /tmp/dutest/cache/tmp/giant.iso
+      5.0 MiB  /tmp/dutest/logs/app.log
+      3.0 MiB  /tmp/dutest/projects/appA/build.tar.gz
+   -- stale (>= 1.0 MiB, untouched 90+ days) --
+      8.0 MiB  /tmp/dutest/cache/tmp/giant.iso  (mtime 2025-01-15)
 
-== /tmp/srv-data -- 46.3 MB in 6 files ==
--- heaviest directories (cumulative) --
-     46.3 MB  /tmp/srv-data
-     25.7 MB  /tmp/srv-data/db
-     25.7 MB  /tmp/srv-data/db/backups
-     20.5 MB  /tmp/srv-data/app
-     12.4 MB  /tmp/srv-data/app/logs
--- largest files --
-     14.3 MB  /tmp/srv-data/db/backups/db_2026-05-01.sql.gz  (modified 2026-05-01)
-     11.4 MB  /tmp/srv-data/db/backups/db_2026-08-24.sql.gz  (modified 2026-08-25)
-      8.6 MB  /tmp/srv-data/app/logs/app.log  (modified 2026-08-25)
--- stale files (untouched > 60 days, top 5 by size) --
-     14.3 MB  /tmp/srv-data/db/backups/db_2026-05-01.sql.gz  (modified 2026-05-01)
-      5.7 MB  /tmp/srv-data/app/cache/assets.bin  (modified 2026-04-10)
-  reclaimable if archived: 20.0 MB across 2 stale files
+== growth since 2026-09-04T13:50:04-05:00
+   /tmp/dutest:
+   +  4.0 MiB  logs/  (5.0 MiB -> 9.0 MiB)
+   +  2.0 MiB  projects/  (4.0 MiB -> 6.0 MiB)
 ```
 
 ## Troubleshooting
 
-- **Numbers differ slightly from `du`** — `du` reports *allocated blocks*
-  (sparse files, block rounding); this script reports *apparent size*
-  (`stat.size`). Both are "right"; know which one you want.
-- **Scan is slow on huge trees** — it's one full walk; on multi-million-file
-  trees run it against subtrees, or via `nice`/`ionice` from cron.
-- **Permission noise** — unreadable files/dirs are skipped and counted in the
-  `unreadable` figure rather than aborting the scan.
-- **`df` shows a filesystem you don't care about** — dedupe keeps the first
-  mount per device; squashfs/loop devices can be filtered by extending
-  `filesystems`.
+- **Numbers differ from `du`.** `du` reports *allocated blocks* (and follows
+  hardlinks differently); this script sums apparent file sizes via `lstat`.
+  Sparse files and heavy hardlinking are the usual causes of a gap.
+- **`df` column missing / weird on BSD.** The script uses `df -kP` (POSIX mode)
+  precisely to stabilise columns; if your platform lacks `-P`, the capacity
+  block is skipped and everything else still works.
+- **Scan is slow on NFS.** Millions of `lstat` calls over the wire hurt; run it
+  on the fileserver itself, or point it at specific subtrees.
+- **Permission noise.** Run with `sudo` for a complete picture; the unreadable
+  count in the summary tells you how much you're missing.
+- **Root of `/`.** Scanning `/` works (prefix handling is `delete_prefix`-safe)
+  but consider per-mount invocations so one filesystem's totals don't mix with
+  another's.
 
 ## Extending it
 
-- `--min-size` floor so tiny files never clutter the lists
-- Trend mode: write each run's JSON to disk and diff growth run-over-run
-- An `--exclude PATTERN` list for cache/venv directories
-- Wire exit codes into Nagios/Icinga or a systemd timer + OnFailure alert
+- Group by *owner* (`st.uid` -> `Etc.getpwuid`) for "who owns the disk" reports.
+- Add `--one-file-system` by comparing `st.dev` against the root's device.
+- Emit Prometheus metrics instead of text (see this repo's
+  [prometheus-exporter](../prometheus-exporter)).
+- Auto-prune: wire the stale list to `File.delete` behind an explicit
+  `--delete-stale-older-than` flag with a dry-run default.
+- Keep dated snapshots and plot growth over weeks with your favourite grapher.
 
 ## References
 
-- [Ruby Find module docs](https://docs.ruby-lang.org/en/3.0/Find.html)
-- [POSIX df specification](https://pubs.opengroup.org/onlinepubs/9699919799/utilities/df.html)
-- Blog post: https://tha-shed.com/ (Ruby for DevOps series)
+- Ruby stdlib `Find`: https://docs.ruby-lang.org/en/3.3/Find.html
+- Ruby `File::Stat`: https://docs.ruby-lang.org/en/3.3/File/Stat.html
+- POSIX `df`: https://pubs.opengroup.org/onlinepubs/9699919799/utilities/df.html
+- Tutorial on tha-shed.com: https://tha-shed.com/ (Ruby for DevOps series)
