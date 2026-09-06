@@ -71,6 +71,9 @@ in a few minutes and dropped straight onto a box.
 | [`smart-disk-health/smart_disk_health.rb`](smart-disk-health/) | Linux | S.M.A.R.T. health report for every disk via `smartctl --json`: ATA failure-predictor attributes, NVMe health log, temperature thresholds, OK/WARN/CRIT verdict with exit codes. |
 | [`oom-kill-report/oom_kill_report.rb`](oom-kill-report/) | Linux | Parses `journalctl -k` / `dmesg` for OOM-killer events and reports kills per process (RSS), per cgroup (memory limit hit), and a per-day timeline; JSON output for alerting. |
 | [`win-reboot-pending/win_reboot_pending.rb`](win-reboot-pending/) | Windows | Checks seven registry indicators (CBS, Windows Update, PendingFileRenameOperations, computer rename, domain join, ConfigMgr, Update.exe) to answer whether a reboot is pending; exit-code deploy gate with a portable `--self-test`. |
+| [`journald-error-digest/journald_error_digest.rb`](journald-error-digest/) | Linux | Collapses journalctl JSON output into a ranked, de-duplicated digest of distinct problems per unit (IPs/PIDs/paths normalised into signatures). |
+| [`net-iface-monitor/net_iface_monitor.rb`](net-iface-monitor/) | Linux | Samples /proc/net/dev and reports per-NIC throughput plus error/drop deltas with Nagios-style OK/WARN/CRIT exit codes. |
+| [`win-profile-cleanup/win_profile_cleanup.rb`](win-profile-cleanup/) | Windows | Audits Win32_UserProfile via WMI for stale and orphaned-SID profiles, reports reclaimable space, and deletes only behind --dry-run/--yes guards. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
