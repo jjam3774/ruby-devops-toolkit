@@ -1,0 +1,1 @@
+{"device":{"name":"/dev/nvme1","type":"nvme"},"model_name":"KINGSTON SA2000M8500G","serial_number":"50026B7XXXXXXX","smart_status":{"passed":false},"temperature":{"current":47},"power_on_time":{"hours":19934},"nvme_smart_health_information_log":{"critical_warning":4,"available_spare":6,"available_spare_threshold":10,"percentage_used":97,"media_errors":12,"unsafe_shutdowns":220}}
