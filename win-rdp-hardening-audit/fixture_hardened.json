@@ -1,0 +1,28 @@
+{
+  "HKLM": {
+    "SYSTEM\\CurrentControlSet\\Control\\Terminal Server": {
+      "fDenyTSConnections": 0
+    },
+    "SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp": {
+      "UserAuthentication": 1,
+      "SecurityLayer": 2,
+      "MinEncryptionLevel": 3,
+      "PortNumber": 3389,
+      "MaxDisconnectionTime": 3600000
+    },
+    "SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services": {
+      "UserAuthentication": 1,
+      "SecurityLayer": 2,
+      "MinEncryptionLevel": 4,
+      "MaxIdleTime": 900000,
+      "fDisableClip": 1,
+      "fDisableCdm": 1,
+      "fPromptForPassword": 1
+    },
+    "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules": {
+      "__ALL__": {
+        "RemoteDesktop-UserMode-In-TCP": "v2.31|Action=Allow|Active=TRUE|Dir=In|Protocol=6|Profile=Domain|LPort=3389|RA4=10.20.0.0/16|App=%SystemRoot%\\system32\\svchost.exe|Svc=termservice|Name=@FirewallAPI.dll,-28775|"
+      }
+    }
+  }
+}
