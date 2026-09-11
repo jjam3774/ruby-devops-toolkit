@@ -83,6 +83,9 @@ in a few minutes and dropped straight onto a box.
 | [`swap-hog-report/swap_hog_report.rb`](swap-hog-report/) | Linux | Ranks processes by VmSwap from /proc/<pid>/status with system-wide totals from /proc/meminfo and /proc/swaps, top-N share analysis, --json, --root fixture mode and Nagios-style exit codes (0/1/2/3). |
 | [`stale-mount-detector/stale_mount_detector.rb`](stale-mount-detector/) | Linux | Probes NFS/CIFS/SSHFS/GlusterFS/CephFS mounts from /proc/mounts in per-mount threads with a hard Thread#join timeout so hung mounts report HUNG instead of hanging the checker; maps ESTALE/ENOENT/EIO to STALE/HUNG, --json, --types/--all, exit codes. |
 | [`win-firmware-inventory/win_firmware_inventory.rb`](win-firmware-inventory/) | Windows | BIOS version/age, TPM presence/spec/activation, Secure Boot registry state, DIMM slots, disks and serials via WMI (win32ole) + Win32::Registry; grades FAIL/WARN/INFO with exit codes, --json, --csv fleet rows, and a --mock JSON source for testing anywhere. |
+| [`nfs-exports-audit/nfs_exports_audit.rb`](nfs-exports-audit/) | Linux | Audits /etc/exports (+ exports.d) and the live `exportfs -v` table for no_root_squash, insecure, world/broad exports, sensitive paths, async and nested-wider exports; exit 0/1/2. |
+| [`orphan-file-audit/orphan_file_audit.rb`](orphan-file-audit/) | Linux | Finds files owned by deleted users/groups (CIS 6.1.11/6.1.12) via a pure-Ruby walker or captured `find -printf` output, ranks them by risk and prints the `chown` remediation. |
+| [`win-nameres-audit/win_nameres_audit.rb`](win-nameres-audit/) | Windows | Audits LLMNR, NetBIOS over TCP/IP (per adapter via WMI), mDNS, WPAD, SMB1 and SMB signing — the Responder/ntlmrelayx attack surface — with PASS/FAIL and the exact fix per check. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
