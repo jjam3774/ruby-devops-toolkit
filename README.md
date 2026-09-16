@@ -86,6 +86,9 @@ in a few minutes and dropped straight onto a box.
 | [`nfs-exports-audit/nfs_exports_audit.rb`](nfs-exports-audit/) | Linux | Audits /etc/exports (+ exports.d) and the live `exportfs -v` table for no_root_squash, insecure, world/broad exports, sensitive paths, async and nested-wider exports; exit 0/1/2. |
 | [`orphan-file-audit/orphan_file_audit.rb`](orphan-file-audit/) | Linux | Finds files owned by deleted users/groups (CIS 6.1.11/6.1.12) via a pure-Ruby walker or captured `find -printf` output, ranks them by risk and prints the `chown` remediation. |
 | [`win-nameres-audit/win_nameres_audit.rb`](win-nameres-audit/) | Windows | Audits LLMNR, NetBIOS over TCP/IP (per adapter via WMI), mDNS, WPAD, SMB1 and SMB signing — the Responder/ntlmrelayx attack surface — with PASS/FAIL and the exact fix per check. |
+| [`mac-posture-audit/mac_posture_audit.rb`](mac-posture-audit/) | Linux | Audits the Mandatory Access Control posture (AppArmor/SELinux) and correlates process labels with listening sockets to find network-facing daemons running unconfined. |
+| [`elf-rpath-audit/elf_hardening_audit.rb`](elf-rpath-audit/) | Linux | Pure-Ruby ELF parser that flags hijackable RPATH/RUNPATH entries (relative, world-writable, missing) and missing hardening — RELRO, PIE, exec stack — with severity scaled by SUID. |
+| [`win-print-spooler-audit/win_print_spooler_audit.rb`](win-print-spooler-audit/) | Windows | Audits the Print Spooler attack surface via WMI and the registry: PrintNightmare/Point-and-Print policies, spooler role, FILE: ports and sideloaded drivers. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
