@@ -89,6 +89,9 @@ in a few minutes and dropped straight onto a box.
 | [`mac-posture-audit/mac_posture_audit.rb`](mac-posture-audit/) | Linux | Audits the Mandatory Access Control posture (AppArmor/SELinux) and correlates process labels with listening sockets to find network-facing daemons running unconfined. |
 | [`elf-rpath-audit/elf_hardening_audit.rb`](elf-rpath-audit/) | Linux | Pure-Ruby ELF parser that flags hijackable RPATH/RUNPATH entries (relative, world-writable, missing) and missing hardening — RELRO, PIE, exec stack — with severity scaled by SUID. |
 | [`win-print-spooler-audit/win_print_spooler_audit.rb`](win-print-spooler-audit/) | Windows | Audits the Print Spooler attack surface via WMI and the registry: PrintNightmare/Point-and-Print policies, spooler role, FILE: ports and sideloaded drivers. |
+| [`cgroup-resource-audit/cgroup_resource_audit.rb`](cgroup-resource-audit/) | Linux | Audits systemd unit resource limits and live headroom straight from cgroup v2 — in-cgroup OOM kills, memory caps near the wall, CPU throttling, task-limit exhaustion and PSI stalls. |
+| [`ca-trust-store-audit/ca_trust_store_audit.rb`](ca-trust-store-audit/) | Linux / macOS | Audits the system CA trust store for expired or weak anchors, leaf certificates installed as anchors, and every root added locally rather than shipped by the distribution. |
+| [`win-driver-signing-audit/win_driver_signing_audit.rb`](win-driver-signing-audit/) | Windows | Audits installed kernel-mode drivers over WMI for signing status, age, provenance and file location, with a BYOVD blocklist check and an offline fixture mode. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
