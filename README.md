@@ -92,6 +92,9 @@ in a few minutes and dropped straight onto a box.
 | [`cgroup-resource-audit/cgroup_resource_audit.rb`](cgroup-resource-audit/) | Linux | Audits systemd unit resource limits and live headroom straight from cgroup v2 — in-cgroup OOM kills, memory caps near the wall, CPU throttling, task-limit exhaustion and PSI stalls. |
 | [`ca-trust-store-audit/ca_trust_store_audit.rb`](ca-trust-store-audit/) | Linux / macOS | Audits the system CA trust store for expired or weak anchors, leaf certificates installed as anchors, and every root added locally rather than shipped by the distribution. |
 | [`win-driver-signing-audit/win_driver_signing_audit.rb`](win-driver-signing-audit/) | Windows | Audits installed kernel-mode drivers over WMI for signing status, age, provenance and file location, with a BYOVD blocklist check and an offline fixture mode. |
+| [`auditd-rules-audit/auditd_rules_audit.rb`](auditd-rules-audit/) | Linux | Parses auditd rule files, cuts the list at the `-e 2` immutable flag so dead rules stop counting toward coverage, and reports gaps against ten baseline control objectives. |
+| [`lvm-capacity-report/lvm_capacity_report.rb`](lvm-capacity-report/) | Linux | Reports LVM volume-group free space, thin-pool data and metadata usage, and snapshot fill, with a days-to-full projection from growth observed between runs. |
+| [`win-optional-features-audit/win_optional_features_audit.rb`](win-optional-features-audit/) | Windows | Enumerates Windows optional features over WMI, flags SMBv1, PowerShell 2.0, Telnet and other legacy attack surface by severity, and emits the exact DISM remediation line. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
