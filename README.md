@@ -95,6 +95,9 @@ in a few minutes and dropped straight onto a box.
 | [`auditd-rules-audit/auditd_rules_audit.rb`](auditd-rules-audit/) | Linux | Parses auditd rule files, cuts the list at the `-e 2` immutable flag so dead rules stop counting toward coverage, and reports gaps against ten baseline control objectives. |
 | [`lvm-capacity-report/lvm_capacity_report.rb`](lvm-capacity-report/) | Linux | Reports LVM volume-group free space, thin-pool data and metadata usage, and snapshot fill, with a days-to-full projection from growth observed between runs. |
 | [`win-optional-features-audit/win_optional_features_audit.rb`](win-optional-features-audit/) | Windows | Enumerates Windows optional features over WMI, flags SMBv1, PowerShell 2.0, Telnet and other legacy attack surface by severity, and emits the exact DISM remediation line. |
+| [`sshd-config-audit/sshd_config_audit.rb`](sshd-config-audit/) | Linux | Audits an OpenSSH server config the way sshd reads it -- first-value-wins, Include splicing, and Match blocks that hand back what the global section denied. |
+| [`repo-trust-audit/repo_trust_audit.rb`](repo-trust-audit/) | Linux (apt + dnf/yum) | Audits every trusted package repository and its signing keys: trusted=yes / gpgcheck=0, the legacy global apt keyring, expired or revoked keys, and pins above the distribution. |
+| [`win-auditpol-audit/win_auditpol_audit.rb`](win-auditpol-audit/) | Windows | Compares the effective advanced audit policy from auditpol.exe against a CIS-style baseline, and flags the legacy-policy override and undersized Security log that silently undo it. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
@@ -175,6 +178,8 @@ wasn't available in this environment; its parsing (`parse_icacls_output`) and ri
 (`evaluate_ace`) logic is instead fully unit-tested with an injectable `runner:` feeding
 realistic `icacls` output â see `ntfs-acl-audit/ntfs_acl_audit_test.rb` (11 tests, all
 passing).
+
+The sshd config auditor and repository trust auditor were both tested live in a Linux sandbox -- the sshd auditor against a fixture tree with an Include drop-in and two Match blocks (one of which deliberately re-enables root password logins), and the repository auditor against both the sandbox's real apt configuration and a fixture tree containing a trusted=yes repo, a gpgcheck=0 dnf repo, a Pin-Priority 1001 stanza and two genuinely expired/expiring GPG keys generated with gpg --faked-system-time. The Windows audit policy auditor depends on auditpol.exe and Win32::Registry, neither of which exists on Linux; its CSV parser, baseline scoring and registry rules are instead covered by an 18-check stub harness that injects a fake command runner and a fixture registry hash, plus a portable --self-test mode -- see win-auditpol-audit/README.md for what that does and does not prove.
 
 ## License
 
