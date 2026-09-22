@@ -98,6 +98,9 @@ in a few minutes and dropped straight onto a box.
 | [`sshd-config-audit/sshd_config_audit.rb`](sshd-config-audit/) | Linux | Audits an OpenSSH server config the way sshd reads it -- first-value-wins, Include splicing, and Match blocks that hand back what the global section denied. |
 | [`repo-trust-audit/repo_trust_audit.rb`](repo-trust-audit/) | Linux (apt + dnf/yum) | Audits every trusted package repository and its signing keys: trusted=yes / gpgcheck=0, the legacy global apt keyring, expired or revoked keys, and pins above the distribution. |
 | [`win-auditpol-audit/win_auditpol_audit.rb`](win-auditpol-audit/) | Windows | Compares the effective advanced audit policy from auditpol.exe against a CIS-style baseline, and flags the legacy-policy override and undersized Security log that silently undo it. |
+| [`pam-stack-audit/pam_stack_audit.rb`](pam-stack-audit/) | Linux | Resolves every @include in /etc/pam.d and flags policy gaps and ordering bugs -- a sufficient rule short-circuiting pam_faillock, half-wired lockout, nullok, weak password hashing. |
+| [`boot-cmdline-audit/boot_cmdline_audit.rb`](boot-cmdline-audit/) | Linux | Diffs the running kernel command line against /etc/default/grub plus its drop-ins, separating "needs a reboot" from "never configured", and grades both against a hardening baseline. |
+| [`win-pagefile-audit/win_pagefile_audit.rb`](win-pagefile-audit/) | Windows | Audits pagefile sizing and crash-dump configuration via WMI across a fleet, catching the hosts that would produce no memory dump at all when they bugcheck. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
