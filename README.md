@@ -101,6 +101,9 @@ in a few minutes and dropped straight onto a box.
 | [`pam-stack-audit/pam_stack_audit.rb`](pam-stack-audit/) | Linux | Resolves every @include in /etc/pam.d and flags policy gaps and ordering bugs -- a sufficient rule short-circuiting pam_faillock, half-wired lockout, nullok, weak password hashing. |
 | [`boot-cmdline-audit/boot_cmdline_audit.rb`](boot-cmdline-audit/) | Linux | Diffs the running kernel command line against /etc/default/grub plus its drop-ins, separating "needs a reboot" from "never configured", and grades both against a hardening baseline. |
 | [`win-pagefile-audit/win_pagefile_audit.rb`](win-pagefile-audit/) | Windows | Audits pagefile sizing and crash-dump configuration via WMI across a fleet, catching the hosts that would produce no memory dump at all when they bugcheck. |
+| [`db-backup-manager/db_backup_manager.rb`](db-backup-manager/) | Linux / macOS | Streams gzip-compressed PostgreSQL/MySQL logical backups via Open3, enforces a retention policy, and restore-tests the dump into a scratch database. |
+| [`ftp-dir-sync/ftp_dir_sync.rb`](ftp-dir-sync/) | Linux / macOS / Windows | Zero-gem one-way directory sync to a remote FTP server using stdlib net/ftp: size/SHA-256 diffing, retries, and recursive orphan cleanup. |
+| [`scheduled-task-manager/scheduled_task_manager.rb`](scheduled-task-manager/) | Windows | Idempotent Windows Scheduled Task create/update/remove via the Task Scheduler COM API (WIN32OLE); fixture-tested off Windows. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
