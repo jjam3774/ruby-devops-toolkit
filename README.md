@@ -104,6 +104,9 @@ in a few minutes and dropped straight onto a box.
 | [`db-backup-manager/db_backup_manager.rb`](db-backup-manager/) | Linux / macOS | Streams gzip-compressed PostgreSQL/MySQL logical backups via Open3, enforces a retention policy, and restore-tests the dump into a scratch database. |
 | [`ftp-dir-sync/ftp_dir_sync.rb`](ftp-dir-sync/) | Linux / macOS / Windows | Zero-gem one-way directory sync to a remote FTP server using stdlib net/ftp: size/SHA-256 diffing, retries, and recursive orphan cleanup. |
 | [`scheduled-task-manager/scheduled_task_manager.rb`](scheduled-task-manager/) | Windows | Idempotent Windows Scheduled Task create/update/remove via the Task Scheduler COM API (WIN32OLE); fixture-tested off Windows. |
+[`deploy-webhook-orchestrator/deploy_webhook_orchestrator.rb`](deploy-webhook-orchestrator/) | Linux / macOS / Windows | REST deploy-API orchestrator: trigger, poll to completion with retrying/backoff HTTP, and automatic rollback on failure or timeout. |
+[`account-provisioner/account_provisioner.rb`](account-provisioner/) | Linux / macOS | Idempotent local account reconciliation from a YAML spec via Etc -- users, groups, shell, lock state, and SSH authorized_keys, dry-run by default. |
+[`power-plan-enforcer/power_plan_enforcer.rb`](power-plan-enforcer/) | Windows | Enforces active power plan (WMI), Fast Startup (registry), and hibernation (powercfg.exe) from one YAML policy; fixture-tested off Windows. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
