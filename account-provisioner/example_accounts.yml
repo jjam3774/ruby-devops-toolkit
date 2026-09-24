@@ -1,0 +1,25 @@
+# Example spec for account_provisioner.rb.
+# Run: ruby account_provisioner.rb --spec example_accounts.yml   (dry-run, default)
+#      ruby account_provisioner.rb --spec example_accounts.yml --apply
+
+managed_uid_min: 1000
+managed_uid_max: 2000
+prune_unmanaged: false
+
+groups:
+  - name: deploy
+
+users:
+  - name: svc_deploy
+    shell: /usr/sbin/nologin
+    comment: "CI deploy service account"
+    groups: [deploy]
+    ssh_authorized_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnlyNotReal svc_deploy@ci-runner"
+
+  - name: alice
+    shell: /bin/bash
+    comment: "Alice Nguyen"
+    locked: false
+
+  - name: old_contractor
+    state: absent
