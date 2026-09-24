@@ -1,0 +1,8 @@
+# Example policy for power_plan_enforcer.rb.
+# Run (on Windows, elevated for --apply):
+#   ruby power_plan_enforcer.rb --policy policy.yml            (dry-run)
+#   ruby power_plan_enforcer.rb --policy policy.yml --apply
+
+active_plan: "High performance"
+fast_startup_enabled: false
+hibernation_enabled: false
