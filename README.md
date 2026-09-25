@@ -107,6 +107,9 @@ in a few minutes and dropped straight onto a box.
 [`deploy-webhook-orchestrator/deploy_webhook_orchestrator.rb`](deploy-webhook-orchestrator/) | Linux / macOS / Windows | REST deploy-API orchestrator: trigger, poll to completion with retrying/backoff HTTP, and automatic rollback on failure or timeout. |
 [`account-provisioner/account_provisioner.rb`](account-provisioner/) | Linux / macOS | Idempotent local account reconciliation from a YAML spec via Etc -- users, groups, shell, lock state, and SSH authorized_keys, dry-run by default. |
 [`power-plan-enforcer/power_plan_enforcer.rb`](power-plan-enforcer/) | Windows | Enforces active power plan (WMI), Fast Startup (registry), and hibernation (powercfg.exe) from one YAML policy; fixture-tested off Windows. |
+| [`log-shipper/log_shipper.rb`](log-shipper/) | Linux / macOS / Windows | Tails log files and forwards new lines to syslog (RFC 5424/UDP) and/or an HTTP sink in real time, tracking per-file inode/offset so restarts and rotation never re-ship or drop lines. |
+| [`git-release-tagger/git_release_tagger.rb`](git-release-tagger/) | Cross-platform (git) | Computes the next semver bump from Conventional Commits since the last tag, generates a grouped changelog, and creates an annotated git tag (with optional GitHub Release publishing). |
+| [`win-rdp-session-manager/win_rdp_session_manager.rb`](win-rdp-session-manager/) | Windows | Audits Remote Desktop/Terminal Services sessions via `quser`, flags idle/disconnected sessions past a threshold, and logs off stale ones behind a `--dry-run` guard. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
@@ -189,6 +192,8 @@ realistic `icacls` output â see `ntfs-acl-audit/ntfs_acl_audit_test.rb` (11
 passing).
 
 The sshd config auditor and repository trust auditor were both tested live in a Linux sandbox -- the sshd auditor against a fixture tree with an Include drop-in and two Match blocks (one of which deliberately re-enables root password logins), and the repository auditor against both the sandbox's real apt configuration and a fixture tree containing a trusted=yes repo, a gpgcheck=0 dnf repo, a Pin-Priority 1001 stanza and two genuinely expired/expiring GPG keys generated with gpg --faked-system-time. The Windows audit policy auditor depends on auditpol.exe and Win32::Registry, neither of which exists on Linux; its CSV parser, baseline scoring and registry rules are instead covered by an 18-check stub harness that injects a fake command runner and a fixture registry hash, plus a portable --self-test mode -- see win-auditpol-audit/README.md for what that does and does not prove.
+
+The log shipper and git release tagger were both tested live against real infrastructure in a Linux sandbox -- the log shipper against real files on disk, a real bound UDPSocket standing in for a syslog server, and a real local TCPServer HTTP stub (covering offset tracking, rotation detection, and partial-sink-failure handling), and the release tagger against a real throwaway git repository with real commits, including reading a real `git tag -a` back out of the repo afterward to confirm its message. The RDP session manager depends on Windows-only `quser.exe`/`logoff.exe`; its fixed-width column parser and idle/disconnect threshold logic are instead fully unit-tested against real captured `quser` output (including the blank-SESSIONNAME disconnected-session edge case) fed through a stubbed process runner -- see `win-rdp-session-manager/test_win_rdp_session_manager.rb` (22 assertions, all passing).
 
 ## License
 
