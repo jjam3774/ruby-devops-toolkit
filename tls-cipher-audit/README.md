@@ -101,7 +101,9 @@ of 500 still trips the alert.
 ## How it works
 
 For every target, the script does three separate rounds of real TLS
-handshakes -- see `img/tls-cipher-audit-flow.png` for the full pipeline:
+handshakes -- see the diagram below for the full pipeline:
+
+![tls-cipher-audit handshake pipeline](img/tls-cipher-audit-flow.png)
 
 1. **Protocol support matrix.** For each of `SSLv3`, `TLSv1.0`, `TLSv1.1`,
    `TLSv1.2`, `TLSv1.3`, it builds an `OpenSSL::SSL::SSLContext` with
@@ -139,9 +141,11 @@ shape used by `api-health-check` and `cert-expiry-check` elsewhere in this
 toolkit -- so auditing a few hundred hosts takes roughly as long as the
 slowest handshake, not the sum of all of them.
 
-`img/tls-cipher-audit-matrix.png` shows the full severity table this script
+The diagram below shows the full severity table this script
 implements: which protocol versions and which cipher indicators map to
 WARNING vs CRITICAL, and why.
+
+![tls-cipher-audit severity matrix](img/tls-cipher-audit-matrix.png)
 
 ## Full code
 
