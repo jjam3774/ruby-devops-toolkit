@@ -111,6 +111,10 @@ in a few minutes and dropped straight onto a box.
 | [`git-release-tagger/git_release_tagger.rb`](git-release-tagger/) | Cross-platform (git) | Computes the next semver bump from Conventional Commits since the last tag, generates a grouped changelog, and creates an annotated git tag (with optional GitHub Release publishing). |
 | [`win-rdp-session-manager/win_rdp_session_manager.rb`](win-rdp-session-manager/) | Windows | Audits Remote Desktop/Terminal Services sessions via `quser`, flags idle/disconnected sessions past a threshold, and logs off stale ones behind a `--dry-run` guard. |
 
+| [`tls-cipher-audit/tls_cipher_audit.rb`](tls-cipher-audit/) | Linux | Pure Ruby OpenSSL fleet auditor for weak TLS protocols and cipher suites -- pins per-version handshakes to build a protocol support matrix, negotiates a worst-case cipher, and reports Nagios-style pass/warn/critical severity. |
+| [`usb-device-audit/usb_device_audit.rb`](usb-device-audit/) | Windows | Audits every USB mass-storage device a host has ever seen (live WMI + USBSTOR registry history) against a YAML allow-list, flagging unauthorized devices as CRIT (connected) or WARN (historical); stub-tested off Windows. |
+| [`smtp-alert-digest/smtp_alert_digest.rb`](smtp-alert-digest/) | Linux / macOS / Windows | Collects findings from other cron/monitoring scripts into a spool, dedups repeats within a window, and sends one consolidated Net::SMTP digest email instead of one-alert-per-script. |
+
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
 
