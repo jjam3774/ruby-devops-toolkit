@@ -1,133 +1,82 @@
 # ssh-fleet-runner
 
-Runs the same command across a fleet of Linux hosts concurrently, through a
-bounded thread pool, with a real per-host wall-clock timeout, bounded
-retries with backoff, and a clean pass/fail report you can pipe into cron,
-CI, or a monitoring pipeline.
+Run one shell command across a fleet of Linux hosts concurrently over SSH, and print a pass/fail summary — for the "I have a text file of 40 hostnames and need to run one command on all of them tonight" problem, without reaching for Ansible/Fabric for a one-off.
 
-![ssh-fleet-runner architecture](img/ssh_fleet_runner_architecture.png)
-
-## Why
-
-`for h in $(cat hosts.txt); do ssh $h "$cmd"; done` is the classic bash
-one-liner — but it's serial (one slow/dead host stalls everything queued
-behind it), has no timeout, no retry, and no structured output. This script
-fixes all four in pure Ruby stdlib. It shells out to the system `ssh` binary
-(so it uses your existing `~/.ssh/config`, agent, and `known_hosts`) instead
-of depending on the `net-ssh` gem, which keeps it installable on a bare box
-with nothing but Ruby and OpenSSH.
+![Bounded concurrent fan-out over SSH](img/fanout.png)
 
 ## Prerequisites
 
-- Ruby 2.7+ — standard library only: `optparse`, `open3`, `json`, `timeout`.
-  No gems, no `bundle install`.
-- The OpenSSH client (`ssh`) on the control machine.
-- Key-based auth already working to the fleet — this script passes
-  `-o BatchMode=yes`, so it never prompts for a password; a host that isn't
-  key-authorized just fails fast, which is the point.
+- Ruby 3.0+
+- Gem: [`net-ssh`](https://rubygems.org/gems/net-ssh) (`~> 7.0`) — `gem install net-ssh`
+- SSH key-based auth already set up to the target hosts (this tool does not prompt for passwords)
+
+> **A note on how this was tested:** the sandbox this tutorial was built in has outbound network access blocked to rubygems.org, so `gem install net-ssh` isn't possible there. The script isolates every call that actually touches the network inside `SshBackend`, and everything *around* that — the bounded thread pool, per-host result aggregation, host-order preservation, CLI parsing — is tested against a `FakeBackend` stand-in in `fleet_runner_test.rb`, with no real network or SSH server involved. Run `ruby fleet_runner_test.rb` yourself once you have a working Ruby to see all 12 assertions pass. On a machine with real gem access, `gem install net-ssh` and the script talks to real hosts through the same `SshBackend#run` method.
 
 ## Usage
 
 ```bash
-ruby ssh_fleet_runner.rb --hosts web1,web2,db1 --command "uptime"
+gem install net-ssh
 
-ruby ssh_fleet_runner.rb --hosts-file fleet.txt --command "systemctl is-active nginx" \
-     --user deploy --identity ~/.ssh/deploy_key --concurrency 10 --json
+# From a hosts file (# comments and blank lines are ignored)
+ruby ssh_fleet_runner.rb -f hosts.txt -u deploy -i ~/.ssh/id_ed25519 -- 'uptime'
+
+# Inline host list, custom parallelism
+ruby ssh_fleet_runner.rb -H web01,web02,web03 -u deploy -p 5 -- 'systemctl is-active nginx'
 ```
 
-`fleet.txt` format (one host per line, optional `user@` and `:port`):
+Options:
 
-```
-web1.example.com
-deploy@web2.example.com:2222
-```
+| Flag | Default | Meaning |
+|---|---|---|
+| `-f, --hosts-file PATH` | — | File with one hostname per line |
+| `-H, --hosts LIST` | — | Comma-separated hosts (alternative to `-f`) |
+| `-u, --user USER` | `$USER` | SSH user |
+| `-i, --identity PATH` | — | Private key path |
+| `-p, --parallelism N` | 10 | Max concurrent SSH connections |
+| `-t, --timeout SECONDS` | 10 | Per-host connect timeout |
+| `--port N` | 22 | SSH port |
 
-Exit codes: `0` = every host succeeded, `1` = at least one host failed or
-timed out after retries.
+Exit status is `0` only if every host succeeded; `1` if any host failed or errored — so it composes cleanly into a CI/cron pipeline (`ssh_fleet_runner.rb ... || alert-someone`).
 
 ## How it works
 
-1. **`Target.parse`** splits each `user@host:port` spec apart once, up
-   front, so the rest of the script never re-parses host strings.
-2. **`ShellRunner`** wraps `Open3.popen3` in Ruby's own `Timeout.timeout`.
-   SSH's `ConnectTimeout` only bounds the TCP handshake — if the remote
-   command hangs, only a Ruby-side watchdog catches it, and on timeout the
-   runner sends `TERM` then `KILL` to the ssh process directly.
-3. Commands are built as an **argv array**, never an interpolated shell
-   string, so `Open3` execs `ssh` directly — a hostname or command
-   containing shell metacharacters can't inject anything.
-4. **`SSHFleetRunner#run`** puts every target into a `Queue` and starts
-   `--concurrency` worker threads that pop off it until empty — a bounded
-   pool, not one thread per host, so `--concurrency 10` against a 500-host
-   file stays at 10 connections in flight, not 500 sockets at once.
-   Failures are retried with exponential backoff (`0.5s, 1s, 2s, ...`) up to
-   `--retries` times.
+1. **`SshBackend#run`** wraps a single `Net::SSH.start` call, opens a channel, streams stdout/stderr, and captures the remote exit status via the `exit-status` request. It never raises out to the caller — any `StandardError` (auth failure, timeout, DNS failure) is captured into an `Outcome` with `error` set, so one bad host can't kill the run.
+2. **`run_fleet`** builds a shared work queue of `[host, index]` pairs and spins up `min(parallelism, hosts.size)` threads that each pull from the queue under a `Mutex` until it's empty. Every worker writes its result into `results[idx]` — not `results <<` — so the final array is always in the *original* host order, regardless of which host finishes first. That matters for diffable, script-friendly output.
+3. **`print_summary`** renders each host's status, indented stdout/stderr, and a final `N/M hosts succeeded` line.
+4. The **CLI** (`parse_options`/`load_hosts`) is a thin wrapper: it builds one `SshBackend` and calls `run_fleet`, then exits `0`/`1` based on whether every `Outcome#ok` was true.
 
 ## Example output
 
 ```
-$ ruby ssh_fleet_runner.rb --hosts 127.0.0.1,127.0.0.2 --command "echo hi" --timeout 5 --retries 0 --concurrency 2
-FAIL user@127.0.0.1 (1 attempt, 0.01s)
-     stderr: ssh: connect to host 127.0.0.1 port 22: Connection refused
-FAIL user@127.0.0.2 (1 attempt, 0.0s)
-     stderr: ssh: connect to host 127.0.0.2 port 22: Connection refused
+[OK  ] web01                    exit=0
+        active
+[FAIL] web02                    exit=3
+        stderr: unit not found
+[FAIL] web03                    error: Net::SSH::ConnectionTimeout
+[OK  ] web04                    exit=0
+        active
 
-0/2 hosts succeeded
-$ echo $?
-1
+2/4 hosts succeeded
 ```
-
-## Testing notes
-
-This sandbox's network policy kills any process that tries to bind a
-listening socket, so a real loopback `sshd` wasn't possible to stand up for
-testing here. What *is* real: `Target.parse` and the ssh argv construction
-were verified directly with no stubbing, and the full CLI path (including
-real `ssh` subprocess invocation and error handling) was smoke-tested
-end-to-end against actually-unreachable hosts, producing the exact output
-above. The concurrency/retry/timeout state machine — which needs a
-controllable transport to test deterministically — is exercised in
-`ssh_fleet_runner_test.rb` by injecting a fake `runner:` object in place of
-the real subprocess transport:
-
-```
-$ ruby ssh_fleet_runner_test.rb
-PASS  Target.parse handles bare hostname
-PASS  Target.parse handles user@host:port
-PASS  build_ssh_command includes BatchMode, identity, port, and command
-PASS  a host that fails once then succeeds is retried and reported ok
-PASS  a host that always fails is reported failed after exhausting retries
-PASS  a host that times out is flagged timed_out=true
-PASS  20 targets with concurrency=3 all get processed exactly once
-
-ALL TESTS PASSED
-```
+(Captured from `fleet_runner_test.rb`'s `FakeBackend` scenario — see the "output" tab on the tutorial for the full test run.)
 
 ## Troubleshooting
 
-- **Every host reports "Connection refused" or "Permission denied
-  (publickey)"** — that's `ssh` itself failing, surfaced verbatim in
-  `stderr`. Test the same command by hand
-  (`ssh -o BatchMode=yes user@host true`) before blaming the script.
-- **A host "succeeds" instantly with no output** — `-o
-  StrictHostKeyChecking=accept-new` is set deliberately so first-contact
-  hosts don't hang on an interactive prompt; a typo'd hostname that
-  resolves somewhere unexpected won't be caught by host-key prompting.
-- **Timeouts on a healthy-looking host** — increase `--timeout`; the
-  default (15s) covers a slow-but-working command, not a host under load.
+- **`LoadError: cannot load such file -- net/ssh`** — `gem install net-ssh` wasn't run, or you're on a different Ruby/gemset than you think (`gem env`, `bundle exec` if you're using Bundler).
+- **Every host reports `Net::SSH::AuthenticationFailed`** — the key isn't authorized on the target, or you need `-u` to point at the right remote user. Test one host manually first: `ssh -i ~/.ssh/id_ed25519 deploy@web01`.
+- **Hangs instead of failing fast** — lower `-t/--timeout`; a host that's firewalled (vs. actively refusing) can otherwise sit until the OS-level TCP timeout.
+- **Output looks interleaved/garbled** — it shouldn't be: `results[idx] = ...` writes are per-thread-unique indices (no shared mutation race on the array itself), and printing happens after `workers.each(&:join)`, once everything's finished. If you see garbling, check you haven't modified the loop to print inside each worker thread instead.
+- **Want to run on Windows targets instead** — Windows OpenSSH is supported by `net-ssh` the same way; see this repo's `wmi-process-watchdog` script for a WMI-native alternative when SSH isn't the right tool for the job on Windows.
 
-## Extending
+## Extending it
 
-- Add a `--file local:remote` mode using `scp`/`rsync` through the same
-  worker pool for fleet-wide config pushes.
-- Stream output live per-host instead of buffering, for long-running
-  commands.
-- Add a `--tag` filter so `fleet.txt` can carry metadata for subset runs.
-- Feed JSON output into [`prometheus-exporter`](../prometheus-exporter) in
-  this repo to turn fleet command results into a scrapeable metric.
+- Add `--sudo` to prefix the remote command and handle a sudo password prompt via `channel.on_data` pattern-matching `[sudo] password`.
+- Add `--upload LOCAL:REMOTE` using `Net::SCP` (from the `net-scp` gem) before running the command.
+- Stream results as they complete instead of waiting for the whole fleet, by yielding from `run_fleet` via a block instead of returning an array.
+- Add retry-with-backoff per host inside `SshBackend#run` for flaky links.
 
 ## References
 
-- [Ruby stdlib: Open3](https://ruby-doc.org/stdlib/libdoc/open3/rdoc/Open3.html)
-- [Ruby stdlib: Timeout](https://ruby-doc.org/stdlib/libdoc/timeout/rdoc/Timeout.html)
-- [OpenSSH ssh_config(5)](https://man.openbsd.org/ssh_config)
+- Full script + this README: [`ruby-devops-toolkit/ssh-fleet-runner`](https://github.com/jjam3774/ruby-devops-toolkit/tree/main/ssh-fleet-runner)
+- `net-ssh` on RubyGems: https://rubygems.org/gems/net-ssh
+- `net-ssh` GitHub (usage examples, `Net::SSH.start` options): https://github.com/net-ssh/net-ssh
