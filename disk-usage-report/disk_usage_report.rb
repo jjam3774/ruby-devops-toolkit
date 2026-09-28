@@ -1,169 +1,250 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #
-# disk_usage_report.rb -- answer "what is eating this disk?" in one pass.
+# disk_usage_report.rb — Disk usage reporting and safe cleanup for Linux/macOS.
 #
-# Combines three views a sysadmin usually assembles by hand from df, du and
-# find:
-#
-#   1. Filesystem fill levels (parsed from `df -P`, the POSIX-stable format),
-#      flagged against warn/crit thresholds.
-#   2. The heaviest directories under a scan root -- computed from ONE
-#      recursive walk, sizes aggregated bottom-up, no shelling out to du.
-#   3. The largest and stalest files (old + big = archive candidates).
-#
-# Standard library only. Text or --json output, cron-friendly exit codes:
-#   0 = all filesystems under warn threshold
-#   1 = at least one filesystem over --warn %
-#   2 = at least one filesystem over --crit %
+# Walks a directory tree, reports the biggest top-level subdirectories, flags
+# individual files above a size threshold, and finds "stale junk" (old logs,
+# core dumps, tmp files) that's safe to reclaim — with a dry-run by default
+# and an explicit --clean flag required to actually delete anything.
 #
 # Usage:
-#   ruby disk_usage_report.rb /var/log
-#   ruby disk_usage_report.rb --top 10 --stale-days 90 --warn 80 --crit 90 /srv
-#   ruby disk_usage_report.rb --json /var/log | jq .
+#   ruby disk_usage_report.rb [path] [options]
 #
+# Examples:
+#   ruby disk_usage_report.rb /var                     # report only (dry run)
+#   ruby disk_usage_report.rb /var --top 15 --json
+#   ruby disk_usage_report.rb /var/log --stale-days 30 --clean   # actually delete
+#
+# Author: tha-shed.com Ruby-for-DevOps series
+# Ruby: 3.0+ (stdlib only — no gems required)
+
+require 'find'
 require 'optparse'
 require 'json'
-require 'find'
-require 'time'
+require 'fileutils'
+require 'time' # needed for Time#iso8601 used in the JSON report
 
-opts = { top: 8, stale_days: 30, warn: 80, crit: 90, json: false }
-parser = OptionParser.new do |o|
-  o.banner = 'Usage: disk_usage_report.rb [options] SCAN_ROOT [SCAN_ROOT...]'
-  o.on('--top N', Integer, 'How many heaviest dirs/files to show (default 8)') { |v| opts[:top] = v }
-  o.on('--stale-days N', Integer, 'Files not modified in N days are stale (default 30)') { |v| opts[:stale_days] = v }
-  o.on('--warn PCT', Integer, 'Filesystem WARN threshold %% (default 80)') { |v| opts[:warn] = v }
-  o.on('--crit PCT', Integer, 'Filesystem CRIT threshold %% (default 90)') { |v| opts[:crit] = v }
-  o.on('--json', 'Emit JSON instead of text') { opts[:json] = true }
-end
-parser.parse!(ARGV)
-roots = ARGV
-abort(parser.to_s) if roots.empty?
-
-def human(bytes)
-  units = %w[B KB MB GB TB]
+# Human-readable byte formatting, e.g. 1_536 -> "1.5K"
+def human_size(bytes)
+  units = %w[B K M G T P]
   size = bytes.to_f
-  unit = 0
-  while size >= 1024 && unit < units.size - 1
-    size /= 1024
-    unit += 1
+  idx = 0
+  while size >= 1024.0 && idx < units.length - 1
+    size /= 1024.0
+    idx += 1
   end
-  format(unit.zero? ? '%d %s' : '%.1f %s', size, units[unit])
+  idx.zero? ? "#{bytes}#{units[idx]}" : format('%.1f%s', size, units[idx])
 end
 
-# ---------------------------------------------------------------------------
-# 1. Filesystem fill levels via `df -P` (POSIX output: stable columns, one
-#    line per filesystem -- safe to parse, unlike the default GNU format).
-# ---------------------------------------------------------------------------
-def filesystems
-  out = `df -P -k 2>/dev/null`
-  seen = {} # dedupe bind mounts: same device listed once, first mount wins
-  out.lines.drop(1).filter_map do |line|
-    cols = line.split
-    next if cols.size < 6
-    dev, blocks, used, avail, pct, mount = cols[0], cols[1].to_i, cols[2].to_i, cols[3].to_i, cols[4].delete('%').to_i, cols[5..].join(' ')
-    next if dev == 'tmpfs' || dev == 'none' || blocks.zero?
-    next if seen[dev]
-    seen[dev] = true
-    { device: dev, mount: mount, size_kb: blocks, used_kb: used, avail_kb: avail, used_pct: pct }
+# Patterns that are conventionally safe "junk" on a Linux/macOS box.
+# Deliberately conservative: only well-known throwaway artifacts.
+STALE_PATTERNS = [
+  /\.log(\.\d+)?(\.gz)?\z/i,
+  /\.tmp\z/i,
+  /\A#.*#\z/,        # emacs autosave
+  /\.swp\z/,         # vim swap
+  /\Acore(\.\d+)?\z/,
+  /\.old\z/i
+].freeze
+
+# Walks +root+ once, collecting:
+#   - size per immediate child directory of root (for the "top consumers" table)
+#   - individual files >= large_file_bytes
+#   - "stale" files matching STALE_PATTERNS whose mtime is older than stale_days
+# Symlinks are not followed (Find#prune-free traversal skips them), and any
+# directory we can't stat/read (permission denied) is counted, not fatal.
+class DiskWalker
+  Result = Struct.new(:by_child, :large_files, :stale_files, :total_bytes,
+                       :files_scanned, :dirs_skipped, keyword_init: true)
+
+  def initialize(root, large_file_bytes:, stale_days:, excludes:)
+    @root = File.expand_path(root)
+    @large_file_bytes = large_file_bytes
+    @stale_cutoff = Time.now - (stale_days * 86_400)
+    @excludes = excludes.map { |e| File.expand_path(e) }
   end
-end
 
-# ---------------------------------------------------------------------------
-# 2 + 3. One recursive walk per root. For every file we bill its size to every
-# ancestor directory up to the root, so directory totals are cumulative --
-# what `du -s` would report -- but from a single pass that also collects the
-# largest/stalest file lists at the same time.
-# ---------------------------------------------------------------------------
-def scan(root, stale_before)
-  dir_sizes = Hash.new(0)
-  files = []
-  errors = 0
-  root = File.expand_path(root)
+  def walk
+    by_child = Hash.new(0)
+    large_files = []
+    stale_files = []
+    total_bytes = 0
+    files_scanned = 0
+    dirs_skipped = 0
 
-  Find.find(root) do |path|
-    begin
-      stat = File.lstat(path)
-    rescue Errno::ENOENT, Errno::EACCES
-      errors += 1
+    Find.find(@root) do |path|
+      if excluded?(path)
+        Find.prune if File.directory?(path)
+        next
+      end
+
+      begin
+        stat = File.lstat(path)
+      rescue Errno::ENOENT, Errno::EACCES
+        dirs_skipped += 1 if File.directory?(path) rescue nil
+        next
+      end
+
+      next if stat.symlink? # never follow or count symlink targets twice
+      next if stat.directory?
+
+      size = stat.size
+      total_bytes += size
+      files_scanned += 1
+
+      child = top_level_child(path)
+      by_child[child] += size if child
+
+      large_files << [path, size] if size >= @large_file_bytes
+
+      if stale?(path) && stat.mtime < @stale_cutoff
+        stale_files << [path, size, stat.mtime]
+      end
+    rescue Errno::EACCES, Errno::ENOENT
+      dirs_skipped += 1
       next
     end
-    if stat.directory?
-      dir_sizes[path] += 0 # make empty dirs visible
-    elsif stat.file?
-      files << { path: path, bytes: stat.size, mtime: stat.mtime }
-      # bill the file to every ancestor up to (and including) the root
-      dir = File.dirname(path)
-      while dir.start_with?(root)
-        dir_sizes[dir] += stat.size
-        break if dir == root
-        dir = File.dirname(dir)
-      end
-    end
+
+    Result.new(
+      by_child: by_child.sort_by { |_, v| -v }.to_h,
+      large_files: large_files.sort_by { |_, s| -s },
+      stale_files: stale_files.sort_by { |_, s, _| -s },
+      total_bytes: total_bytes,
+      files_scanned: files_scanned,
+      dirs_skipped: dirs_skipped
+    )
   end
 
-  stale = files.select { |f| f[:mtime] < stale_before }
-  { root: root, dir_sizes: dir_sizes, files: files, stale: stale, errors: errors }
+  private
+
+  def excluded?(path)
+    @excludes.any? { |e| path == e || path.start_with?("#{e}/") }
+  end
+
+  def stale?(path)
+    STALE_PATTERNS.any? { |re| re.match?(File.basename(path)) }
+  end
+
+  # Bucket a file under the first path segment below @root, so /var/log/foo.log
+  # and /var/log/bar.log both roll up under "log" when root is /var.
+  def top_level_child(path)
+    rel = path.delete_prefix("#{@root}/")
+    return nil if rel == path # path wasn't under root (shouldn't happen)
+
+    rel.split('/').first
+  end
 end
 
-stale_before = Time.now - opts[:stale_days] * 86_400
-fs = filesystems
-worst = fs.map { |f| f[:used_pct] }.max || 0
-exit_code = worst >= opts[:crit] ? 2 : (worst >= opts[:warn] ? 1 : 0)
-
-reports = roots.map { |r| scan(r, stale_before) }
-
-if opts[:json]
-  payload = {
-    generated_at: Time.now.utc.iso8601,
-    thresholds: { warn_pct: opts[:warn], crit_pct: opts[:crit] },
-    filesystems: fs,
-    scans: reports.map do |rep|
-      {
-        root: rep[:root],
-        total_bytes: rep[:dir_sizes][rep[:root]] || 0,
-        file_count: rep[:files].size,
-        unreadable: rep[:errors],
-        heaviest_dirs: rep[:dir_sizes].sort_by { |_, v| -v }.first(opts[:top])
-                          .map { |d, b| { dir: d, bytes: b } },
-        largest_files: rep[:files].max_by(opts[:top]) { |f| f[:bytes] }
-                          .map { |f| { path: f[:path], bytes: f[:bytes], mtime: f[:mtime].utc.iso8601 } },
-        stale_files: rep[:stale].sort_by { |f| -f[:bytes] }.first(opts[:top])
-                          .map { |f| { path: f[:path], bytes: f[:bytes], mtime: f[:mtime].utc.iso8601 } },
-        stale_total_bytes: rep[:stale].sum { |f| f[:bytes] }
-      }
-    end
+def parse_options(argv)
+  opts = {
+    top: 10,
+    large_file_bytes: 100 * 1024 * 1024, # 100MB
+    stale_days: 60,
+    json: false,
+    clean: false,
+    excludes: []
   }
-  puts JSON.pretty_generate(payload)
-else
-  puts '== Filesystems =='
-  fs.each do |f|
-    badge = f[:used_pct] >= opts[:crit] ? '[CRIT]' : (f[:used_pct] >= opts[:warn] ? '[WARN]' : '[ OK ]')
-    puts format('%s %-28s %-16s %9s used of %-9s (%d%%)',
-                badge, f[:device], f[:mount], human(f[:used_kb] * 1024), human(f[:size_kb] * 1024), f[:used_pct])
+
+  parser = OptionParser.new do |o|
+    o.banner = 'Usage: disk_usage_report.rb [path] [options]'
+    o.on('--top N', Integer, 'How many top directories/files to show (default 10)') { |v| opts[:top] = v }
+    o.on('--large-mb N', Integer, 'Flag individual files >= N MB (default 100)') { |v| opts[:large_file_bytes] = v * 1024 * 1024 }
+    o.on('--stale-days N', Integer, 'Consider junk files older than N days stale (default 60)') { |v| opts[:stale_days] = v }
+    o.on('--exclude PATH', 'Exclude a path from the scan (repeatable)') { |v| opts[:excludes] << v }
+    o.on('--json', 'Emit JSON instead of a text report') { opts[:json] = true }
+    o.on('--clean', 'Actually delete stale junk files found (default is dry-run report only)') { opts[:clean] = true }
+    o.on('-h', '--help', 'Show this help') { puts o; exit 0 }
   end
-  reports.each do |rep|
-    total = rep[:dir_sizes][rep[:root]] || 0
-    puts
-    puts "== #{rep[:root]} -- #{human(total)} in #{rep[:files].size} files" \
-         "#{rep[:errors] > 0 ? " (#{rep[:errors]} unreadable, skipped)" : ''} =="
-    puts "-- heaviest directories (cumulative) --"
-    rep[:dir_sizes].sort_by { |_, v| -v }.first(opts[:top]).each do |dir, bytes|
-      puts format('  %10s  %s', human(bytes), dir)
+  parser.parse!(argv)
+
+  opts[:root] = argv.first || '.'
+  opts
+end
+
+def print_text_report(result, opts)
+  puts "Disk usage report for #{File.expand_path(opts[:root])}"
+  puts "Files scanned: #{result.files_scanned}  |  Unreadable dirs skipped: #{result.dirs_skipped}"
+  puts "Total size: #{human_size(result.total_bytes)}"
+  puts
+
+  puts "== Top #{opts[:top]} subdirectories by size =="
+  result.by_child.first(opts[:top]).each do |name, size|
+    pct = result.total_bytes.zero? ? 0 : (size.to_f / result.total_bytes * 100)
+    printf("  %-30s %10s  (%.1f%%)\n", name, human_size(size), pct)
+  end
+  puts
+
+  puts "== Files >= #{human_size(opts[:large_file_bytes])} (top #{opts[:top]}) =="
+  if result.large_files.empty?
+    puts '  none found'
+  else
+    result.large_files.first(opts[:top]).each do |path, size|
+      printf("  %10s  %s\n", human_size(size), path)
     end
-    puts "-- largest files --"
-    rep[:files].max_by(opts[:top]) { |f| f[:bytes] }.each do |f|
-      puts format('  %10s  %s  (modified %s)', human(f[:bytes]), f[:path], f[:mtime].strftime('%Y-%m-%d'))
-    end
-    unless rep[:stale].empty?
-      puts "-- stale files (untouched > #{opts[:stale_days]} days, top #{opts[:top]} by size) --"
-      rep[:stale].sort_by { |f| -f[:bytes] }.first(opts[:top]).each do |f|
-        puts format('  %10s  %s  (modified %s)', human(f[:bytes]), f[:path], f[:mtime].strftime('%Y-%m-%d'))
-      end
-      puts format('  reclaimable if archived: %s across %d stale files',
-                  human(rep[:stale].sum { |f| f[:bytes] }), rep[:stale].size)
-    end
+  end
+  puts
+
+  reclaimable = result.stale_files.sum { |_, s, _| s }
+  puts "== Stale junk older than #{opts[:stale_days]}d (logs/tmp/core/swap) =="
+  puts "  #{result.stale_files.size} files, #{human_size(reclaimable)} reclaimable"
+  result.stale_files.first(opts[:top]).each do |path, size, mtime|
+    printf("  %10s  %s  (mtime %s)\n", human_size(size), path, mtime.strftime('%Y-%m-%d'))
   end
 end
 
-exit exit_code
+def print_json_report(result, opts)
+  puts JSON.pretty_generate(
+    root: File.expand_path(opts[:root]),
+    total_bytes: result.total_bytes,
+    files_scanned: result.files_scanned,
+    dirs_skipped: result.dirs_skipped,
+    top_subdirectories: result.by_child.first(opts[:top]).map { |n, s| { name: n, bytes: s } },
+    large_files: result.large_files.first(opts[:top]).map { |p, s| { path: p, bytes: s } },
+    stale_files: result.stale_files.map { |p, s, m| { path: p, bytes: s, mtime: m.iso8601 } },
+    stale_reclaimable_bytes: result.stale_files.sum { |_, s, _| s }
+  )
+end
+
+def clean_stale_files!(result)
+  freed = 0
+  result.stale_files.each do |path, size, _|
+    File.delete(path)
+    freed += size
+    puts "deleted: #{path} (#{human_size(size)})"
+  rescue Errno::ENOENT, Errno::EACCES => e
+    warn "skip #{path}: #{e.message}"
+  end
+  puts "\nFreed #{human_size(freed)} across #{result.stale_files.size} files."
+end
+
+if __FILE__ == $PROGRAM_NAME
+  opts = parse_options(ARGV)
+  walker = DiskWalker.new(
+    opts[:root],
+    large_file_bytes: opts[:large_file_bytes],
+    stale_days: opts[:stale_days],
+    excludes: opts[:excludes]
+  )
+  result = walker.walk
+
+  if opts[:json]
+    print_json_report(result, opts)
+  else
+    print_text_report(result, opts)
+  end
+
+  if opts[:clean]
+    if result.stale_files.empty?
+      puts "\nNothing to clean."
+    else
+      print "\nAbout to permanently delete #{result.stale_files.size} files. Type 'yes' to confirm: "
+      confirm = $stdin.gets&.strip
+      if confirm == 'yes'
+        clean_stale_files!(result)
+      else
+        puts 'Aborted — no files deleted.'
+      end
+    end
+  end
+end
