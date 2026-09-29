@@ -1,0 +1,9 @@
+Leap Indicator: 0(no warning)
+Stratum: 3 (secondary reference - syncd by (S)NTP)
+Precision: -23 (119.209ns per tick)
+Root Delay: 0.0312500s
+Root Dispersion: 0.0467529s
+ReferenceId: 0x0A000001 (source IP:  10.0.0.1)
+Last Successful Sync Time: 9/29/2026 3:12:01 PM
+Source: dc01.corp.local
+Poll Interval: 10 (1024s)
