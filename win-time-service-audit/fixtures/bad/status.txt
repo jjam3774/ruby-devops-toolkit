@@ -1,0 +1,6 @@
+Leap Indicator: 3(not synchronized)
+Stratum: 0 (unspecified)
+Precision: -23 (119.209ns per tick)
+Last Successful Sync Time: 9/20/2026 8:00:00 AM
+Source: Local CMOS Clock
+Poll Interval: 10 (1024s)

@@ -1,0 +1,13 @@
+[Config]
+
+EventLogFlags: 2 (Local)
+AnnounceFlags: 10 (Local)
+MaxPosPhaseCorrection: 4294967295 (Local)
+MaxNegPhaseCorrection: 172800 (Local)
+
+[NtpClient]
+
+DllName: w32time.dll (Local)
+Enabled: 0 (Local)
+NtpServer: dc01.corp.local,0x9 (Local)
+Type: NTP (Local)
