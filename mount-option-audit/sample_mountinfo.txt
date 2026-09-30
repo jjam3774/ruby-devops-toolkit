@@ -1,0 +1,6 @@
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+23 22 0:20 / /tmp rw,nosuid,nodev,noexec,relatime shared:2 - tmpfs tmpfs rw,size=2G
+24 22 0:21 / /dev/shm rw,nosuid,nodev shared:3 - tmpfs tmpfs rw
+25 22 8:2 / /home rw,nosuid,nodev,relatime shared:4 - ext4 /dev/sda2 rw
+26 22 8:3 / /boot rw,relatime shared:5 - ext4 /dev/sda3 rw
+27 22 8:4 / /mnt/my\040disk rw,relatime shared:6 - ext4 /dev/sda4 rw
