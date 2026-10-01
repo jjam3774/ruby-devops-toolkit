@@ -120,6 +120,9 @@ in a few minutes and dropped straight onto a box.
 | proc-state-audit/proc_state_audit.rb | Linux | Finds zombie processes (grouped by the parent that needs fixing) and stuck D-state processes from /proc, with Nagios-style exit codes and a --root fixture mode. |
 | win-time-service-audit/win_time_service_audit.rb | Windows | Audits the Windows Time service via w32tm: free-running clock source, stale last-sync, stratum, NtpClient type/enabled, and phase-correction limits. Fixture mode runs off-Windows. |
 | core-dump-audit/core_dump_audit.rb | Linux | Audits Linux core-dump handling: core_pattern handler, suid_dumpable, limits.conf core limits and dump-directory disk usage, with the exact fix for each finding. |
+| cpu-saturation-monitor/cpu_saturation_monitor.rb | Linux | Splits CPU load into busy, iowait and steal from /proc/stat deltas plus load-per-core and PSI, with a hint per finding and 0/1/2 exit codes. |
+| win-uac-audit/win_uac_audit.rb | Windows | Grades User Account Control registry settings (EnableLUA, admin prompt behavior, secure desktop, remote token filtering) with the exact fix; --fixture and --self-test run off-Windows. |
+| login-defs-audit/login_defs_audit.rb | Linux | Audits /etc/login.defs password-aging policy and checks /etc/shadow accounts that override it, with chage remediation. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
