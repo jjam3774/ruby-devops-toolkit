@@ -1,240 +1,139 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 #
-# cron_audit.rb — inventory, validate, and risk-check cron jobs.
-#
-# Cron is where automation goes to be forgotten. This script walks the
-# system cron surface (/etc/crontab, /etc/cron.d/*, optionally user spool
-# files), and for every job:
-#
-#   * validates the schedule (5-field syntax, ranges, steps, @aliases)
-#   * computes the NEXT RUN time with a small pure-Ruby cron matcher
-#   * risk-checks the command line:
-#       - script referenced by the job is missing            -> BROKEN
-#       - script is world/group-writable or not owned root   -> RISK
-#       - `curl ... | sh` style pipe-to-shell                -> RISK
-#       - relative path in command (PATH surprises)          -> WARN
-#
-# Stdlib only. Text and --json output. Exit codes: 0 clean, 1 warnings,
-# 2 broken/risky findings — drop it straight into cron itself or CI.
-#
-# Usage:
-#   ruby cron_audit.rb                        # /etc/crontab + /etc/cron.d
-#   ruby cron_audit.rb --file mycrontab --no-system --json
-
-require 'json'
+# cron_audit.rb - audit Linux cron tables for broken or risky jobs.
+# Ruby 3.0+, stdlib only. Usage: ruby cron_audit.rb [--json] [--root DIR]
 require 'optparse'
+require 'json'
 require 'time'
-require 'etc'
 
-options = { system: true, files: [], spool: nil, json: false, horizon_days: 8 }
+Finding = Struct.new(:severity, :file, :line, :rule, :message, keyword_init: true)
 
-OptionParser.new do |o|
-  o.banner = 'Usage: cron_audit.rb [options]'
-  o.on('--file FILE', 'Audit an extra crontab file (repeatable)') { |v| options[:files] << v }
-  o.on('--spool DIR', 'Also read user spool dir (e.g. /var/spool/cron/crontabs)') { |v| options[:spool] = v }
-  o.on('--no-system', 'Skip /etc/crontab and /etc/cron.d') { options[:system] = false }
-  o.on('--json', 'Emit JSON instead of text') { options[:json] = true }
-end.parse!
+FIELD_RANGES = { minute: 0..59, hour: 0..23, dom: 1..31, month: 1..12, dow: 0..7 }.freeze
+MACROS = %w[@reboot @yearly @annually @monthly @weekly @daily @midnight @hourly].freeze
 
-# ---------------------------------------------------------------------------
-# Schedule parsing. Each of the 5 fields expands to a Set of allowed values;
-# validation and next-run matching then both fall out of the same structure.
-# ---------------------------------------------------------------------------
-FIELD_RANGES = [0..59, 0..23, 1..31, 1..12, 0..7].freeze # min hour dom mon dow
-MONTH_NAMES = %w[jan feb mar apr may jun jul aug sep oct nov dec].freeze
-DAY_NAMES   = %w[sun mon tue wed thu fri sat].freeze
-ALIASES = {
-  '@hourly'   => '0 * * * *',   '@daily'  => '0 0 * * *',
-  '@midnight' => '0 0 * * *',   '@weekly' => '0 0 * * 0',
-  '@monthly'  => '0 0 1 * *',   '@yearly' => '0 0 1 1 *',
-  '@annually' => '0 0 1 1 *'
-}.freeze
-
-# Expand one cron field ("*/15", "1-5", "mon,wed", "3") into a sorted array.
-# Returns nil if the field is invalid — that's how validation reports errors.
-def expand_field(field, idx)
-  range = FIELD_RANGES[idx]
-  values = []
-  field.downcase.split(',').each do |part|
-    step = 1
-    if part.include?('/')
-      part, step_s = part.split('/', 2)
-      step = step_s.to_i
-      return nil if step < 1
-    end
-    # translate month/day names into numbers where the field allows them
-    part = (MONTH_NAMES.index(part) + 1).to_s if idx == 3 && MONTH_NAMES.include?(part)
-    part = DAY_NAMES.index(part).to_s        if idx == 4 && DAY_NAMES.include?(part)
-
-    lo, hi =
-      if part == '*'
-        [range.first, range.last]
-      elsif part =~ /\A(\d+)-(\d+)\z/
-        [Regexp.last_match(1).to_i, Regexp.last_match(2).to_i]
-      elsif part =~ /\A\d+\z/
-        [part.to_i, part.to_i]
-      else
-        return nil
-      end
-    return nil if lo < range.first || hi > range.last || lo > hi
-    lo.step(hi, step) { |v| values << v }
+# Expand one cron field ("*/15", "1-5", "1,3,7") into a sorted array of ints.
+# Raises ArgumentError for anything out of range or malformed.
+def expand_field(text, range)
+  values = text.split(',').flat_map do |part|
+    base, step = part.split('/', 2)
+    step = step ? Integer(step, 10) : 1
+    raise ArgumentError, "step must be > 0 in '#{part}'" if step < 1
+    lo, hi = if base == '*' then [range.min, range.max]
+             elsif base.include?('-') then base.split('-', 2).map { |n| Integer(n, 10) }
+             else v = Integer(base, 10); [v, step > 1 ? range.max : v]
+             end
+    raise ArgumentError, "'#{part}' outside #{range}" unless range.cover?(lo) && range.cover?(hi) && lo <= hi
+    (lo..hi).step(step).to_a
   end
-  # cron treats dow 7 as sunday
-  values.map! { |v| idx == 4 && v == 7 ? 0 : v }
   values.uniq.sort
 end
 
-def parse_schedule(sched)
-  sched = ALIASES.fetch(sched, sched)
-  return { reboot: true } if sched == '@reboot'
-  fields = sched.split
-  return nil unless fields.size == 5
-  expanded = fields.each_with_index.map { |f, i| expand_field(f, i) }
-  return nil if expanded.any?(&:nil?)
-  { min: expanded[0], hour: expanded[1], dom: expanded[2], mon: expanded[3], dow: expanded[4] }
+# Parse a crontab line. system_table => has a user column (/etc/crontab, cron.d).
+def parse_line(raw, system_table)
+  line = raw.strip
+  return nil if line.empty? || line.start_with?('#')
+  return [:env, line] if line =~ /\A[A-Za-z_][A-Za-z0-9_]*\s*=/
+  parts = line.split(/\s+/, line.start_with?('@') ? 2 : 6)
+  if line.start_with?('@')
+    sched = [parts[0]]
+    rest = parts[1].to_s
+  else
+    sched = parts[0, 5]
+    rest = parts[5].to_s
+  end
+  user = nil
+  if system_table
+    user, rest = rest.split(/\s+/, 2)
+  end
+  [:job, { schedule: sched, user: user, command: rest.to_s }]
 end
 
-# Walk forward minute-by-minute until the schedule matches. Cron semantics:
-# if BOTH dom and dow are restricted, a match on either one fires the job.
-def next_run(sched, from = Time.now, horizon_days = 8)
-  return nil if sched[:reboot]
-  t = Time.new(from.year, from.month, from.day, from.hour, from.min) + 60
-  dom_restricted = sched[:dom].size < 31
-  dow_restricted = sched[:dow].size < 7
-  (horizon_days * 1440).times do
-    if sched[:min].include?(t.min) && sched[:hour].include?(t.hour) && sched[:mon].include?(t.month)
-      day_ok =
-        if dom_restricted && dow_restricted
-          sched[:dom].include?(t.day) || sched[:dow].include?(t.wday)
-        else
-          sched[:dom].include?(t.day) && sched[:dow].include?(t.wday)
-        end
-      return t if day_ok
-    end
+def next_run(sched, from = Time.now)
+  return nil if sched.size == 1
+  m, h, dom, mon, dow = FIELD_RANGES.keys.zip(sched).map { |k, f| expand_field(f, FIELD_RANGES[k]) }
+  dow = dow.map { |d| d % 7 }.uniq
+  dom_star = sched[2] == '*'
+  dow_star = sched[4] == '*'
+  t = Time.at((from.to_i / 60 + 1) * 60)
+  # Walk forward minute by minute for up to ~1 year; fine for an audit tool.
+  (366 * 24 * 60).times do
+    day_ok = if dom_star && dow_star then true
+             elsif dom_star then dow.include?(t.wday)
+             elsif dow_star then dom.include?(t.day)
+             else dom.include?(t.day) || dow.include?(t.wday) # cron ORs when both restricted
+             end
+    return t if mon.include?(t.month) && day_ok && h.include?(t.hour) && m.include?(t.min)
     t += 60
   end
   nil
 end
 
-# ---------------------------------------------------------------------------
-# Command risk checks
-# ---------------------------------------------------------------------------
-def first_script(command)
-  # strip env assignments (FOO=bar cmd) and leading wrappers we can see through
-  tokens = command.strip.split(/\s+/)
-  tokens.shift while tokens.first =~ /\A\w+=/
-  tokens.shift if %w[nice ionice timeout flock].include?(tokens.first) # skip common wrappers + their flag args crudely
-  tok = tokens.find { |t| t.start_with?('/') }
-  tok
-end
-
-def check_command(command)
+def audit_file(path, system_table)
   findings = []
-  findings << ['RISK', 'pipe-to-shell (curl|wget piped into a shell)'] if command =~ /\b(curl|wget)\b[^|;]*\|\s*(ba|z|da)?sh\b/
-  script = first_script(command)
-  if script.nil?
-    findings << ['WARN', 'no absolute path in command — relies on cron PATH (often just /usr/bin:/bin)']
-  elsif !File.exist?(script)
-    findings << ['BROKEN', "referenced file missing: #{script}"]
-  else
-    st = File.stat(script)
-    findings << ['RISK', "#{script} is world-writable"] if st.mode & 0o002 != 0
-    findings << ['RISK', "#{script} is group-writable"] if st.mode & 0o020 != 0
-    if st.uid != 0
-      owner = (Etc.getpwuid(st.uid).name rescue st.uid.to_s)
-      findings << ['WARN', "#{script} not owned by root (owner: #{owner}) — anyone with that account can change what cron runs"]
+  File.readlines(path, chomp: true).each_with_index do |raw, i|
+    kind, data = parse_line(raw, system_table)
+    next unless kind == :job
+    n = i + 1
+    add = ->(sev, rule, msg) { findings << Finding.new(severity: sev, file: path, line: n, rule: rule, message: msg) }
+    sched = data[:schedule]
+    if sched.size == 1
+      add.(:error, 'bad-macro', "unknown macro #{sched[0]}") unless MACROS.include?(sched[0])
+    else
+      begin
+        FIELD_RANGES.keys.zip(sched).each { |k, f| expand_field(f, FIELD_RANGES[k]) }
+        nr = next_run(sched)
+        add.(:warn, 'never-runs', 'schedule never fires within a year (e.g. Feb 31)') if nr.nil?
+        add.(:info, 'every-minute', 'runs every minute') if sched.first(5).all? { |f| f == '*' }
+      rescue ArgumentError => e
+        add.(:error, 'bad-schedule', e.message)
+        next
+      end
     end
+    cmd = data[:command]
+    add.(:error, 'no-command', 'job has no command') if cmd.empty?
+    add.(:error, 'bad-user', "no such user '#{data[:user]}'") if data[:user] && !user_exists?(data[:user])
+    exe = cmd.split(/\s+/).first.to_s
+    if exe.start_with?('/')
+      if !File.exist?(exe)
+        add.(:error, 'missing-binary', "#{exe} does not exist")
+      else
+        add.(:warn, 'not-executable', "#{exe} is not executable") unless File.executable?(exe)
+        add.(:error, 'world-writable', "#{exe} is world-writable (root cron can be hijacked)") if File.world_writable?(exe)
+      end
+    end
+    add.(:info, 'no-redirect', 'output not redirected: cron will mail or drop it') unless cmd =~ />|\|\s*(logger|mail)|MAILTO/
   end
   findings
 end
 
-# ---------------------------------------------------------------------------
-# Crontab file parsing. system_format=true means 6th column is the user.
-# ---------------------------------------------------------------------------
-def parse_crontab(path, system_format:, default_user: nil)
-  jobs = []
-  return jobs unless File.readable?(path)
-  File.foreach(path).with_index(1) do |line, ln|
-    line = line.strip
-    next if line.empty? || line.start_with?('#') || line =~ /\A\w+=/ # skip env lines
-    if line.start_with?('@')
-      sched_s, rest = line.split(/\s+/, 2)
-    else
-      parts = line.split(/\s+/, 6)
-      next if parts.size < 6
-      sched_s = parts[0, 5].join(' ')
-      rest = parts[5]
-    end
-    if system_format && !sched_s.start_with?('@reboot')
-      user, command = rest.split(/\s+/, 2)
-    elsif system_format
-      user, command = rest.split(/\s+/, 2)
-    else
-      user = default_user
-      command = rest
-    end
-    next if command.nil? || command.empty?
-    jobs << { file: path, line: ln, user: user, schedule: sched_s, command: command }
-  end
-  jobs
+def user_exists?(name)
+  File.readlines('/etc/passwd').any? { |l| l.start_with?("#{name}:") }
+rescue Errno::ENOENT
+  true
 end
 
-jobs = []
-if options[:system]
-  jobs.concat parse_crontab('/etc/crontab', system_format: true)
-  Dir.glob('/etc/cron.d/*').sort.each do |f|
-    next unless File.file?(f)
-    jobs.concat parse_crontab(f, system_format: true)
-  end
-end
-options[:files].each { |f| jobs.concat parse_crontab(f, system_format: false, default_user: Etc.getlogin) }
-if options[:spool]
-  Dir.glob(File.join(options[:spool], '*')).sort.each do |f|
-    jobs.concat parse_crontab(f, system_format: false, default_user: File.basename(f))
-  end
-end
+options = { root: '/etc', json: false }
+OptionParser.new do |o|
+  o.on('--root DIR', 'directory holding crontab, cron.d (default /etc)') { |v| options[:root] = v }
+  o.on('--json', 'emit JSON') { options[:json] = true }
+end.parse!
 
-now = Time.now
-results = jobs.map do |job|
-  sched = parse_schedule(job[:schedule])
-  findings = []
-  nxt = nil
-  if sched.nil?
-    findings << ['BROKEN', "invalid schedule: '#{job[:schedule]}'"]
-  else
-    nxt = next_run(sched, now, options[:horizon_days])
-    findings << ['WARN', "schedule never fires in next #{options[:horizon_days]} days"] if nxt.nil? && !sched[:reboot]
-  end
-  findings.concat check_command(job[:command])
-  sev_rank = { 'BROKEN' => 2, 'RISK' => 2, 'WARN' => 1 }
-  worst = findings.map { |s, _| sev_rank[s] }.max || 0
-  job.merge(next_run: nxt&.strftime('%Y-%m-%d %H:%M'), findings: findings, worst: worst)
-end
+targets = []
+tab = File.join(options[:root], 'crontab')
+targets << [tab, true] if File.file?(tab)
+Dir.glob(File.join(options[:root], 'cron.d', '*')).sort.each { |f| targets << [f, true] if File.file?(f) }
+%w[/var/spool/cron/crontabs /var/spool/cron].each do |d|
+  Dir.glob(File.join(d, '*')).sort.each { |f| targets << [f, false] if File.file?(f) && File.readable?(f) }
+end if options[:root] == '/etc'
 
-overall = results.map { |r| r[:worst] }.max || 0
-
+findings = targets.flat_map { |f, sys| audit_file(f, sys) }
 if options[:json]
-  puts JSON.pretty_generate(
-    'generated_at' => now.iso8601,
-    'status' => %w[OK WARN CRIT][overall],
-    'jobs' => results.map do |r|
-      { 'file' => r[:file], 'line' => r[:line], 'user' => r[:user],
-        'schedule' => r[:schedule], 'command' => r[:command],
-        'next_run' => r[:next_run],
-        'findings' => r[:findings].map { |s, m| { 'severity' => s, 'message' => m } } }
-    end
-  )
+  puts JSON.pretty_generate(findings.map(&:to_h))
 else
-  puts "cron audit — #{now.strftime('%Y-%m-%d %H:%M')}  jobs: #{results.size}  [#{%w[OK WARN CRIT][overall]}]"
-  results.each do |r|
-    mark = r[:worst] == 2 ? '!!' : r[:worst] == 1 ? ' !' : '  '
-    puts
-    puts "#{mark} #{r[:file]}:#{r[:line]}  (user: #{r[:user]})"
-    puts "     #{r[:schedule]}  ->  next run: #{r[:next_run] || 'n/a'}"
-    puts "     #{r[:command]}"
-    r[:findings].each { |sev, msg| puts "       [#{sev}] #{msg}" }
+  puts "Scanned #{targets.size} cron file(s), #{findings.size} finding(s)"
+  findings.sort_by { |f| [{ error: 0, warn: 1, info: 2 }[f.severity], f.file, f.line] }.each do |f|
+    puts format('%-5s %-14s %s:%d  %s', f.severity.to_s.upcase, f.rule, f.file, f.line, f.message)
   end
 end
-
-exit(overall == 2 ? 2 : overall == 1 ? 1 : 0)
+exit(findings.any? { |f| f.severity == :error } ? 2 : 0)

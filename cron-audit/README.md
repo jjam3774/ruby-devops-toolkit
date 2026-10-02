@@ -1,102 +1,61 @@
-# cron-audit
+# Audit Cron Jobs with Ruby: Catch Dead, Broken and Hijackable Linux Cron Entries
 
-Inventory, validate, and risk-check every cron job on a Linux box — stdlib-only Ruby.
+Cron has no validation step and no alerting. A bad field like 61 makes cron reject the line, a job that points at a script someone deleted just fails into a mailbox nobody reads, and a root job that runs a world-writable script is a privilege-escalation gift. After a few years of hand-edited tables, every server has some of each. This script parses the cron tables itself, expands each schedule to prove it is valid and that it can ever fire, and cross-checks the command and user against the real filesystem.
 
-Cron is where automation goes to be forgotten. Jobs pile up across `/etc/crontab`,
-`/etc/cron.d/*`, and user spools; some reference scripts that were deleted two
-migrations ago, some have schedules that never fire, and some run world-writable
-shell scripts as root — a straightforward privilege-escalation path.
-`cron_audit.rb` walks the whole cron surface and, for every job:
-
-- **validates the schedule** — 5-field syntax, ranges, steps, `mon`/`sun` names,
-  `@daily`-style aliases;
-- **computes the next run time** — a small pure-Ruby cron matcher, including the
-  classic gotcha that when *both* day-of-month and day-of-week are restricted,
-  vixie-cron fires on **either** match (OR, not AND);
-- **risk-checks the command** — missing scripts (`BROKEN`), world/group-writable
-  scripts and `curl | sh` pipes (`RISK`), relative paths that depend on cron's
-  minimal `PATH` (`WARN`), non-root-owned scripts (`WARN`).
-
-![architecture](img/cron_audit_flow.png)
+![pipeline](img/cron-audit-flow.png)
 
 ## Prerequisites
 
-- Ruby >= 2.7 (stdlib only: `json`, `optparse`, `time`, `etc` — no gems)
-- Linux (or any cron-carrying Unix); read access to the crontabs you audit
-  (root needed for `/var/spool/cron/crontabs`)
+- Ruby 3.0 or newer (tested on 3.3.6) - stdlib only, no gems
+- Linux with Vixie/cronie-style crontabs (Debian, Ubuntu, RHEL, Alpine)
+- Root (or read access to /var/spool/cron) to see per-user crontabs; --root DIR lets you audit a copy as any user
 
 ## Usage
 
-```sh
-# audit the system surface: /etc/crontab + /etc/cron.d/*
-ruby cron_audit.rb
-
-# include user spools, JSON for pipelines
-sudo ruby cron_audit.rb --spool /var/spool/cron/crontabs --json
-
-# audit a standalone (user-format) crontab file
-ruby cron_audit.rb --no-system --file deploy.cron
 ```
-
-Exit codes: `0` clean, `1` warnings only, `2` at least one `BROKEN`/`RISK` finding —
-so the auditor itself drops straight into cron or CI.
+ruby cron_audit.rb [--json] [--root DIR]
+```
 
 ## How it works
 
-- **Field expansion is the whole parser.** Each of the 5 schedule fields expands to
-  a sorted array of allowed values (`*/15` becomes `[0,15,30,45]`). Validation errors and
-  next-run matching both fall out of that one structure; `dow` 7 normalises to 0.
-- **Next-run matching walks minutes.** From "now", advance minute-by-minute (max 8
-  days, about 11.5k iterations — microseconds in practice) until minute, hour, month and
-  the dom/dow rule all match. Brute force beats reimplementing croniter wrong.
-- **System vs user format.** `/etc/crontab` and `/etc/cron.d/*` carry a 6th user
-  column; user spool files don't. The parser handles both, skips comments and
-  `NAME=value` environment lines, and records file + line for every job.
-- **Command checks look at the first absolute path** in the command line (after
-  skipping `FOO=bar` prefixes and common wrappers), then `File.stat` it for
-  world/group-write bits and ownership.
+1. **Parse a line** - parse_line skips comments, recognises VAR=value environment lines, and splits a job into five schedule fields (or a single @daily-style macro). System tables (/etc/crontab, cron.d) have an extra user column, so the function takes a system_table flag.
+2. **Expand every field** - expand_field turns */15, 1-5 or 1,3,7 into a sorted array and raises ArgumentError for anything outside the legal range. That one function is both validator and engine.
+3. **Prove the job can run** - next_run walks forward a minute at a time (up to a year) honouring cron's quirk that when both day-of-month and day-of-week are restricted, either may match. A schedule such as Feb 31 never fires, and is reported as never-runs.
+4. **Check the host** - The first word of the command is tested: does it exist, is it executable, is it world-writable? The user column is looked up in /etc/passwd. These are the checks cron itself never does.
+5. **Report and exit code** - Findings sort by severity. Exit status 2 means at least one ERROR, so you can run the audit from CI, a monitoring check or even cron itself.
 
 ## Example output
 
 ```
-cron audit — 2026-08-24 14:50  jobs: 7  [CRIT]
-
-!! /tmp/appjobs.cron:4  (user: deploy)
-     30 2 * * sun  ->  next run: 2026-08-30 02:30
-     /tmp/bin/full_backup.sh --target /backup
-       [RISK] /tmp/bin/full_backup.sh is world-writable
-       [RISK] /tmp/bin/full_backup.sh is group-writable
-
-!! /tmp/appjobs.cron:5  (user: deploy)
-     0 4 * * *  ->  next run: 2026-08-25 04:00
-     /usr/local/bin/prune_uploads.sh
-       [BROKEN] referenced file missing: /usr/local/bin/prune_uploads.sh
-
-!! /tmp/appjobs.cron:8  (user: deploy)
-     5 3 * * *  ->  next run: 2026-08-25 03:05
-     curl -fsSL https://example.com/install.sh | sh
-       [RISK] pipe-to-shell (curl|wget piped into a shell)
+Scanned 2 cron file(s), 9 finding(s)
+ERROR world-writable /tmp/w/etc/cron.d/app:1  /tmp/w/hijack.sh is world-writable (root cron can be hijacked)
+ERROR bad-schedule   /tmp/w/etc/crontab:4  '61' outside 0..59
+ERROR bad-user       /tmp/w/etc/crontab:6  no such user 'ghostuser'
+ERROR missing-binary /tmp/w/etc/crontab:7  /nonexistent/backup.sh does not exist
+ERROR bad-macro      /tmp/w/etc/crontab:8  unknown macro @sometimes
+WARN  never-runs     /tmp/w/etc/crontab:5  schedule never fires within a year (e.g. Feb 31)
+INFO  every-minute   /tmp/w/etc/crontab:3  runs every minute
+INFO  no-redirect    /tmp/w/etc/crontab:3  output not redirected: cron will mail or drop it
+INFO  no-redirect    /tmp/w/etc/crontab:8  output not redirected: cron will mail or drop it
 ```
 
 ## Troubleshooting
 
-- **`jobs: 0`** — nothing readable at the default locations; you may be on a distro
-  where everything lives in systemd timers, or you need `sudo` for the spool dir.
-- **Next run seems off by an hour** — the matcher uses the host's local time, same
-  as crond; check the box's timezone (and remember DST jumps).
-- **False WARN on `cd / && ...`** — the "first absolute path" heuristic can latch
-  onto `/` in compound commands. Findings are advisory; read the line.
-- **Doesn't see anacron/systemd timers** — deliberately out of scope; see Extending.
+- No spool files found: per-user crontabs are root-readable only; run with sudo.
+- False missing-binary: only absolute paths are checked; commands relying on PATH are skipped on purpose.
+- Busybox/Alpine crond: tables live in /etc/crontabs/; copy them to a directory and pass --root.
+- Tested honestly: verified on Linux against a fixture tree with deliberate faults (see Output tab); ran as non-root, so the spool directories were not exercised.
 
 ## Extending
 
-- Add `systemctl list-timers --all` parsing for the systemd side of the house.
-- Diff two runs to alert on *new* cron entries (a favourite persistence mechanism).
-- Validate `MAILTO` and detect jobs that silence output with no other logging.
-- Ship `--json` into your SIEM and alert on `RISK` findings fleet-wide.
+- Mail or Slack the JSON output when the exit code is 2
+- Add a check that scripts called by root are owned by root
+- Flag jobs that overlap by estimating runtime from logs
+- Cross-check against systemd timers (systemctl list-timers)
 
 ## References
 
-- crontab(5) man page: https://man7.org/linux/man-pages/man5/crontab.5.html
-- Ruby stdlib OptionParser: https://docs.ruby-lang.org/en/3.3/OptionParser.html
-- Tutorial with full walkthrough: https://tha-shed.com/ruby-for-devops-auditing-every-cron-job-on-the-box/
+- https://man7.org/linux/man-pages/man5/crontab.5.html
+- https://docs.ruby-lang.org/en/3.3/OptionParser.html
+
+Part of [ruby-devops-toolkit](https://github.com/jjam3774/ruby-devops-toolkit) (MIT).
