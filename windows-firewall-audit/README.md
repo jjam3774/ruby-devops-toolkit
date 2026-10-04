@@ -1,105 +1,53 @@
-# windows-firewall-audit
+# Audit Windows Firewall Inbound Rules with Ruby and netsh
 
-**Platform:** Windows &nbsp;|&nbsp; **Gems required:** none (win32ole stdlib only)
+![workflow](img/firewall-flow.png)
 
-Audits the Windows Defender Firewall rule set via WMI for risky patterns that accumulate over
-years: inbound-allow-any-any rules exposed on the Public profile, and `EdgeTraversalPolicy=Allow`
-settings that let traffic bypass NAT edge protection.
+Over a machine's life, installers and admins add inbound allow rules and nobody removes them. The result is RDP or SMB reachable from anywhere, or an executable in a user's Downloads folder with its own firewall exception. This script shells out to `netsh advfirewall`, parses the verbose rule dump into Ruby hashes, and applies a short set of risk checks. It also has an offline mode so you can audit exported text on any machine.
 
-## The problem
-
-Firewall rule sets grow for years and nobody audits them. Someone opens RDP wide for a debugging
-session and forgets to scope or remove it. A vendor installer adds an inbound-allow-any rule.
-`Get-NetFirewallRule` in PowerShell shows you this one rule at a time — nobody reads 400 rules by
-hand. This script queries the same WMI classes those cmdlets are built on directly via
-`WIN32OLE`, joins them in Ruby, and prints a prioritized findings list.
+Blog post: https://tha-shed.com (search "Audit Windows Firewall Inbound Rules with Ruby and netsh")
 
 ## Prerequisites
-
-- Windows 8 / Server 2012 or later (`ROOT\StandardCimv2` is where the modern firewall WMI
-  provider lives)
-- Ruby with the `win32ole` stdlib library (ships with the standard RubyInstaller on Windows)
-- A shell with rights to query WMI (reads generally work un-elevated; run elevated if you hit
-  access-denied errors)
+- Ruby 2.7+ via RubyInstaller on Windows (tested on 3.3.6 on Linux for the offline mode).
+- Stdlib only. Live mode needs an elevated prompt and an English-locale Windows, because `netsh` labels are localised.
+- Offline: `netsh advfirewall firewall show rule name=all verbose > rules.txt` and `netsh advfirewall show allprofiles state > profiles.txt`.
 
 ## Usage
-
-```powershell
-ruby win_firewall_audit.rb
-ruby win_firewall_audit.rb --json
-ruby win_firewall_audit.rb --profile Public
 ```
-
-Exit codes: `0` = no CRIT findings, `2` = one or more CRIT findings, `1` = error connecting to
-WMI (e.g. run on a non-Windows host).
+ruby firewall_audit.rb
+ruby firewall_audit.rb --json
+ruby firewall_audit.rb --rules rules.txt --profiles profiles.txt
+```
 
 ## How it works
-
-PowerShell's `Get-NetFirewallRule` looks like it returns one flat object per rule, but under the
-hood it's assembling several separate WMI class instances that share an `InstanceID`: the rule
-itself (`MSFT_NetFirewallRule`), its port scope (`MSFT_NetFirewallPortFilter`), and its address
-scope (`MSFT_NetFirewallAddressFilter`).
-
-1. **`WmiSource`** connects via `WIN32OLE.connect('winmgmts:\\.\root\StandardCimv2')` and runs
-   three `ExecQuery` calls. This is the only class that requires `win32ole`, and it's required
-   lazily inside the method so the rest of the file (and its tests) load cleanly on non-Windows
-   hosts.
-2. **`RuleBuilder.build`** joins the three WMI result sets back into one flat `RuleView` struct
-   by shared `InstanceID`, and decodes the `Direction`/`Action` integers and `Profiles` bitmask
-   (1=Domain, 2=Private, 4=Public, OR'd together) into readable values.
-3. **`WinFirewallAudit.evaluate_rule`** is a pure function of a `RuleView` — it only looks at
-   rules that are `Enabled`, `Inbound`, and `Allow`, then checks for a wide-open port, any remote
-   address, and Public profile scope, plus `EdgeTraversalPolicy=Allow` as a separate always-on
-   check. Because it never touches WIN32OLE, it's fully unit-testable without a Windows host.
-
-CRIT is any/any-Public inbound ALLOW, or `EdgeTraversalPolicy=Allow`. WARN is a partially scoped
-but still broader-than-ideal rule.
+1. **Parse the netsh dump**: `parse_rules` splits on the dashed separator lines, then turns each `Key:   Value` line into a hash entry.
+2. **Check profile state**: `parse_profiles` reports any Domain/Private/Public profile whose State is OFF as HIGH.
+3. **Filter to what matters**: Only rules that are Enabled, Direction In, Action Allow can expose the host, so everything else is skipped.
+4. **Apply risk checks**: Known-dangerous ports (RDP 3389, SMB 445, Telnet 23, FTP 21, WinRM) are HIGH when RemoteIP is Any, MEDIUM otherwise. Rules allowing programs from Users, Downloads, Temp or AppData paths are flagged. Any-program/any-port/any-remote on the Public profile is HIGH.
+5. **Report and exit**: Severity-sorted output, `--json` for pipelines, exit 1 if any HIGH.
 
 ## Example output
-
 ```
-$ ruby win_firewall_audit_test.rb
-
-14 assertions, 0 failures
-
-$ ruby win_firewall_audit.rb   (risk engine run against realistic fixtures, on a real Windows host)
-[CRIT] RDP - temp debug access
-       - inbound ALLOW rule open to any remote address, any port, on the Public profile
-[CRIT] IoT management port
-       - EdgeTraversalPolicy=Allow lets this rule bypass NAT edge protection
-
-2 critical, 0 warnings out of 2 flagged rules
-exit: 2
+Parsed 7 rules
+HIGH   firewall-off   Public profile               profile state is OFF
+HIGH   risky-port     Remote Desktop - User Mode (TCP-In) RDP (3389) open to Any on Domain,Private,Public
+MEDIUM risky-port     File and Printer Sharing (SMB-In) SMB (445) open to LocalSubnet on Domain,Private
+MEDIUM odd-program-path Dev Tool Helper              allows inbound for C:\Users\bob\Downloads\helper.exe
+MEDIUM risky-port     Legacy Telnet                Telnet (23) open to 10.0.0.0/8 on Domain
+2 high / 5 total
 ```
 
 ## Troubleshooting
+- **Access denied or empty output:** use an elevated prompt.
+- **Non-English Windows:** netsh field names are translated, so parsing finds zero rules. Use PowerShell `Get-NetFirewallRule` instead (see Extending).
+- **Honest testing note:** `netsh` only exists on Windows. The parser and checks were verified in the Linux sandbox against a hand-built sample of netsh-format output (7 rules, 3 profiles); the live `netsh` call itself was not executed here.
 
-- **"cannot load such file -- win32ole"** — you're running this on a non-Windows host.
-  `win32ole` only exists on Windows Ruby installs.
-- **Empty results / 0 rules found** — confirm the Windows Defender Firewall service (`MpsSvc`)
-  is running.
-- **Access denied connecting to WMI** — re-run from an elevated PowerShell/cmd; some
-  hardened/GPO-locked-down hosts restrict WMI namespace access for non-admins.
-- **How this was tested** — `MSFT_NetFirewallRule` only exists on a live Windows host, which
-  wasn't available in the environment used to build this. The join logic (`RuleBuilder`) and the
-  risk engine (`evaluate_rule`) are instead fully unit-tested with realistic WIN32OLE-shaped
-  fixtures — five rules covering the wide-open, scoped, edge-traversal, disabled, and outbound
-  cases — in `win_firewall_audit_test.rb`, which passes 14 assertions with 0 failures. Verify the
-  WMI-connection layer itself (`WmiSource`) against your own hosts before relying on it in
-  production.
-
-## Extending it
-
-- **Program/service scoping** — pull in `MSFT_NetFirewallApplicationFilter` and
-  `MSFT_NetFirewallServiceFilter` to flag rules with no program/service restriction at all.
-- **Baseline diffing** — snapshot findings to JSON on a known-good day and diff future runs
-  against it.
-- **Auto-remediation** — shell out to `netsh advfirewall firewall set rule` to disable a
-  well-understood CRIT pattern, gated behind a `--fix` flag and confirmation.
-- **Group Policy comparison** — cross-reference local rules against rules pushed by GPO to find
-  shadow rules a local admin added outside of policy.
+## Extending
+- Switch to `Get-NetFirewallRule | ConvertTo-Json` for locale-independent parsing.
+- Diff against a saved baseline to report only new rules.
+- Export findings to CSV for auditors.
+- Remove a flagged rule with `netsh advfirewall firewall delete rule name=...` behind a `--fix` flag.
 
 ## References
-
-- [MSFT_NetFirewallRule class (Microsoft Learn)](https://learn.microsoft.com/en-us/windows/win32/fwp/wmi/wfascimprov/msft-netfirewallrule)
-- [Ruby stdlib: WIN32OLE](https://docs.ruby-lang.org/en/3.3/WIN32OLE.html)
+- [netsh advfirewall reference](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/netsh-advfirewall)
+- [Windows Firewall rules overview](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/)
+- [Ruby OptionParser](https://docs.ruby-lang.org/en/master/OptionParser.html)
