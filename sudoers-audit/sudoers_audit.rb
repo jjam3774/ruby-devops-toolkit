@@ -1,244 +1,133 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
-#
-# sudoers_audit.rb
-#
-# Parses /etc/sudoers (plus any #include / #includedir files it pulls
-# in, exactly like real sudo does) and flags the handful of privilege
-# grants that repeatedly show up in real-world escalation writeups:
-# NOPASSWD root shells, wildcard command paths (which let a "restricted"
-# sudo rule run arbitrary binaries), and sudoers files that are
-# world-writable. It also shells out to `visudo -c` to catch outright
-# syntax errors before they lock someone out of sudo entirely.
-#
-# No gems required -- `optparse`, `json`, and `open3` are stdlib.
-#
-# Usage:
-#   sudo ruby sudoers_audit.rb                      # audit /etc/sudoers (needs root to read it)
-#   ruby sudoers_audit.rb --file ./my_sudoers        # audit any sudoers-format file (testing/CI)
-#   ruby sudoers_audit.rb --file ./my_sudoers --json
-#   ruby sudoers_audit.rb --file ./my_sudoers --skip-visudo   # if visudo isn't installed
-#
-# Exit codes (cron/CI friendly):
-#   0 = no risky entries found
-#   1 = WARN-level findings
-#   2 = CRIT-level findings, a visudo syntax error, or the file couldn't be read
-
+# sudoers_audit.rb - static audit of /etc/sudoers and its includes. Linux. Ruby 2.7+, stdlib only.
+# Read-only: it never calls visudo or sudo. Run as root to read /etc/sudoers (mode 0440).
+# Exit 0 = no findings above INFO, 1 = HIGH/MEDIUM findings.
 require 'optparse'
 require 'json'
-require 'open3'
 
-# ---------------------------------------------------------------------------
-# Parsing
-#
-# This is a lightweight, line-oriented parser -- NOT a full sudoers
-# grammar implementation. It does not resolve User_Alias/Cmnd_Alias
-# definitions, and it splits multiple cmndspecs on the top-level commas
-# sudoers uses between them. That's enough to catch the risk patterns
-# this script looks for; anything using heavy aliasing should also be
-# read by a human, not just this script. See README Troubleshooting.
-# ---------------------------------------------------------------------------
+Finding = Struct.new(:severity, :file, :line, :rule, :detail, keyword_init: true)
 
-SudoersEntry = Struct.new(:file, :line_no, :raw, :who, :host, :runas, :tags_and_cmnds, keyword_init: true)
+class SudoersAudit
+  attr_reader :findings
 
-# Reads one sudoers-format file, following #include/#includedir
-# directives it finds (the same mechanism real sudo uses to pull in
-# /etc/sudoers.d/*), and returns [entries, included_files, errors].
-def parse_sudoers(path, seen = [])
-  entries = []
-  included = []
-  errors = []
-
-  unless File.readable?(path)
-    errors << "cannot read #{path} (permission denied?)"
-    return [entries, included, errors]
+  def initialize(root_file, admin_groups: %w[root %sudo %wheel %admin])
+    @root_file = root_file
+    @admins = admin_groups
+    @findings = []
+    @seen = {}
   end
-  return [entries, included, errors] if seen.include?(File.expand_path(path))
 
-  seen << File.expand_path(path)
-  buffer = nil
+  def run
+    walk(@root_file)
+    @findings
+  end
 
-  File.readlines(path).each_with_index do |raw_line, idx|
-    line_no = idx + 1
-    line = raw_line.chomp
+  private
 
-    # Line continuations: a trailing backslash joins with the next line.
-    if buffer
-      line = buffer + line.sub(/^\s*/, ' ')
-      buffer = nil
-    end
-    if line.end_with?('\\')
-      buffer = line.sub(/\\\z/, '')
-      next
-    end
+  def add(sev, file, line, rule, detail)
+    @findings << Finding.new(severity: sev, file: file, line: line, rule: rule, detail: detail)
+  end
 
-    stripped = line.strip
-    next if stripped.empty?
+  # Recursively follow #include / @include / #includedir / @includedir
+  def walk(path, depth = 0)
+    return add('MEDIUM', path, 0, 'include-depth', 'include nesting > 10') if depth > 10
+    return if @seen[path]
 
-    if stripped.start_with?('#include ')
-      inc_path = stripped.sub('#include ', '').strip
-      included << inc_path
-      sub_entries, sub_included, sub_errors = parse_sudoers(inc_path, seen)
-      entries.concat(sub_entries)
-      included.concat(sub_included)
-      errors.concat(sub_errors)
-      next
-    end
+    @seen[path] = true
+    check_file_perms(path)
+    logical_lines(path).each do |num, text|
+      case text
+      when /\A[#@]include(dir)?\s+(\S+)/
+        target = Regexp.last_match(2)
+        if Regexp.last_match(1)
+          Dir.glob(File.join(target, '*')).sort.each do |f|
+            base = File.basename(f)
+            next if base.include?('.') || base.end_with?('~') # sudo ignores these
 
-    if stripped.start_with?('#includedir ')
-      dir = stripped.sub('#includedir ', '').strip
-      if Dir.exist?(dir)
-        Dir.children(dir).sort.each do |fname|
-          next if fname.start_with?('.') || fname.end_with?('~') || fname.include?('.rpmsave') || fname.include?('.rpmnew')
-
-          sub_path = File.join(dir, fname)
-          included << sub_path
-          sub_entries, sub_included, sub_errors = parse_sudoers(sub_path, seen)
-          entries.concat(sub_entries)
-          included.concat(sub_included)
-          errors.concat(sub_errors)
+            walk(f, depth + 1)
+          end
+        else
+          walk(target, depth + 1)
         end
+      when /\A#/, ''
+        next
       else
-        errors << "#includedir target #{dir} does not exist"
+        check_rule(path, num, text)
       end
-      next
-    end
-
-    next if stripped.start_with?('#') # plain comment
-    next if stripped.match?(/^(Defaults|User_Alias|Host_Alias|Cmnd_Alias|Runas_Alias)\b/)
-
-    m = stripped.match(/\A(\S+)\s+(\S+)\s*=\s*(?:\(([^)]*)\)\s*)?(.+)\z/)
-    next unless m # not a user-spec line we recognize; ignore rather than false-flag
-
-    entries << SudoersEntry.new(
-      file: path, line_no: line_no, raw: stripped,
-      who: m[1], host: m[2], runas: m[3], tags_and_cmnds: m[4]
-    )
-  end
-
-  [entries, included, errors]
-end
-
-# ---------------------------------------------------------------------------
-# Risk logic -- pure function over parsed entries, no file I/O.
-# ---------------------------------------------------------------------------
-WILDCARD_CMND = /[*?]/.freeze
-
-def classify_entry(entry)
-  findings = []
-  cmndspecs = entry.tags_and_cmnds.split(/,(?![^(]*\))/).map(&:strip)
-
-  cmndspecs.each do |spec|
-    nopasswd = spec.match?(/\bNOPASSWD\s*:/)
-    cmnd = spec.sub(/\A(?:NOPASSWD|PASSWD|NOEXEC|EXEC|SETENV|NOSETENV|LOG_INPUT|NOLOG_INPUT|LOG_OUTPUT|NOLOG_OUTPUT)\s*:\s*/i, '').strip
-    is_all_cmnd = cmnd == 'ALL'
-    has_wildcard = cmnd.match?(WILDCARD_CMND)
-    broad_who = %w[ALL].include?(entry.who) || entry.who.start_with?('%')
-
-    if entry.who == 'ALL' && (is_all_cmnd || nopasswd)
-      findings << { severity: 'CRIT', reason: "who=ALL (every local account) granted '#{cmnd}'#{nopasswd ? ' with NOPASSWD' : ''}" }
-    elsif nopasswd && is_all_cmnd
-      findings << { severity: 'CRIT', reason: "NOPASSWD: ALL -- passwordless full-root grant for '#{entry.who}'" }
-    elsif nopasswd && has_wildcard
-      findings << { severity: 'CRIT', reason: "NOPASSWD with a wildcard command ('#{cmnd}') -- wildcards can usually be abused to run arbitrary binaries" }
-    elsif nopasswd
-      findings << { severity: 'WARN', reason: "NOPASSWD grant for '#{entry.who}' on '#{cmnd}' -- passwordless, review if still needed" }
-    elsif has_wildcard
-      findings << { severity: 'WARN', reason: "wildcard command spec '#{cmnd}' -- verify it can't be pointed at an unintended binary" }
-    elsif is_all_cmnd && broad_who
-      findings << { severity: 'WARN', reason: "'#{entry.who}' can run ALL commands (password required) -- confirm this group is meant to be full sudoers" }
     end
   end
 
-  findings
+  # Join backslash-continued lines; strip trailing comments.
+  def logical_lines(path)
+    out = []
+    buf = +''
+    start = 1
+    File.foreach(path).with_index(1) do |raw, n|
+      line = raw.chomp
+      start = n if buf.empty?
+      if line.end_with?('\\')
+        buf << line.chomp('\\') << ' '
+        next
+      end
+      buf << line
+      out << [start, buf.sub(/(?<!^)\s+#.*\z/, '').strip]
+      buf = +''
+    end
+    out
+  end
+
+  def check_file_perms(path)
+    st = File.stat(path)
+    add('HIGH', path, 0, 'bad-owner', "owned by uid #{st.uid}, must be root") unless st.uid.zero?
+    add('HIGH', path, 0, 'world-writable', format('mode %04o', st.mode & 0o7777)) if (st.mode & 0o002) != 0
+    add('MEDIUM', path, 0, 'group-writable', format('mode %04o', st.mode & 0o7777)) if (st.mode & 0o020) != 0
+  rescue SystemCallError => e
+    add('INFO', path, 0, 'unreadable', e.message)
+  end
+
+  def check_rule(file, num, text)
+    return if text =~ /\A(User_Alias|Runas_Alias|Host_Alias|Cmnd_Alias)\b/
+
+    who = text.split(/\s+/, 2).first
+    if text =~ /\bDefaults.*!authenticate/
+      add('HIGH', file, num, 'no-authenticate', 'Defaults !authenticate disables passwords globally')
+    end
+    if text =~ /\bDefaults.*!(use_pty|requiretty)|\bDefaults.*env_keep.*(LD_|PYTHON|RUBY)/
+      add('MEDIUM', file, num, 'weak-defaults', text)
+    end
+    return unless text =~ /=/ && text !~ /\ADefaults/
+
+    nopasswd = text.include?('NOPASSWD')
+    all_cmds = text =~ /(?:\)|:|=|,)\s*(?:NOPASSWD:\s*)?ALL\s*\z/
+    is_admin = @admins.include?(who)
+    add('HIGH', file, num, 'nopasswd-all', "#{who}: passwordless ALL") if nopasswd && all_cmds
+    add('MEDIUM', file, num, 'nopasswd', "#{who}: NOPASSWD rule") if nopasswd && !all_cmds
+    add('MEDIUM', file, num, 'unexpected-all', "#{who}: full ALL access") if all_cmds && !is_admin && who != 'root'
+    add('HIGH', file, num, 'wildcard-cmd', "#{who}: wildcard in command (arg injection risk)") if text =~ /\/\S*\*/
+    if text =~ %r{/(vi|vim|nano|less|more|man|find|awk|python\d?|perl|ruby|bash|sh|zsh|tar|env)\b}
+      add('HIGH', file, num, 'shell-escape', "#{who}: #{Regexp.last_match(1)} allows shell escape to root")
+    end
+  end
 end
 
-def check_file_permissions(path)
-  return [] unless File.exist?(path)
+if $PROGRAM_NAME == __FILE__
+  opts = { file: '/etc/sudoers', json: false }
+  OptionParser.new do |o|
+    o.on('-f', '--file PATH', 'root sudoers file (default /etc/sudoers)') { |v| opts[:file] = v }
+    o.on('-j', '--json') { opts[:json] = true }
+  end.parse!
+  abort "cannot read #{opts[:file]} (run as root?)" unless File.readable?(opts[:file])
 
-  stat = File.stat(path)
-  findings = []
-  findings << { severity: 'CRIT', reason: "#{path} is world-writable (mode #{format('%o', stat.mode & 0o777)}) -- any local user could edit sudo policy" } if stat.mode & 0o002 != 0
-  findings << { severity: 'WARN', reason: "#{path} is group-writable (mode #{format('%o', stat.mode & 0o777)}) -- confirm the group is trusted" } if stat.mode & 0o020 != 0
-  findings
-end
-
-def run_visudo(path)
-  out, status = Open3.capture2e('visudo', '-c', '-f', path)
-  { ok: status.success?, output: out.strip }
-rescue Errno::ENOENT
-  { ok: nil, output: 'visudo not found on PATH' }
-end
-
-# ---------------------------------------------------------------------------
-# Run
-# ---------------------------------------------------------------------------
-if __FILE__ == $PROGRAM_NAME
-  options = { file: '/etc/sudoers', json: false, skip_visudo: false }
-  parser = OptionParser.new do |opts|
-    opts.banner = 'Usage: sudoers_audit.rb [--file PATH] [options]'
-    opts.on('--file PATH', 'Sudoers file to audit (default: /etc/sudoers)') { |v| options[:file] = v }
-    opts.on('--json', 'Emit machine-readable JSON instead of text') { options[:json] = true }
-    opts.on('--skip-visudo', 'Skip the visudo -c syntax check') { options[:skip_visudo] = true }
-    opts.on('-h', '--help', 'Show this help') { puts opts; exit 0 }
-  end
-  parser.parse!
-
-  entries, included_files, parse_errors = parse_sudoers(options[:file])
-
-  if entries.empty? && parse_errors.any?
-    warn "sudoers_audit: #{parse_errors.join('; ')}"
-    exit 2
-  end
-
-  findings = []
-  findings.concat(check_file_permissions(options[:file]).map { |f| f.merge(file: options[:file], line: nil) })
-  included_files.each { |f| findings.concat(check_file_permissions(f).map { |x| x.merge(file: f, line: nil) }) }
-
-  entries.each do |entry|
-    classify_entry(entry).each { |f| findings << f.merge(file: entry.file, line: entry.line_no, raw: entry.raw) }
-  end
-
-  visudo_result = options[:skip_visudo] ? nil : run_visudo(options[:file])
-  if visudo_result && visudo_result[:ok] == false
-    findings << { severity: 'CRIT', reason: "visudo -c reported a syntax error: #{visudo_result[:output]}", file: options[:file], line: nil }
-  end
-
-  if options[:json]
-    puts JSON.pretty_generate(
-      file: options[:file],
-      included_files: included_files,
-      entries_checked: entries.size,
-      visudo: visudo_result,
-      findings: findings
-    )
+  order = { 'HIGH' => 0, 'MEDIUM' => 1, 'INFO' => 2 }
+  fs = SudoersAudit.new(opts[:file]).run.sort_by { |f| [order[f.severity], f.file, f.line] }
+  if opts[:json]
+    puts JSON.pretty_generate(fs.map(&:to_h))
+  elsif fs.empty?
+    puts 'No findings.'
   else
-    if findings.empty?
-      puts "sudoers_audit: #{entries.size} entries across #{1 + included_files.size} file(s) checked, no risky grants found"
-    else
-      findings.sort_by { |f| f[:severity] == 'CRIT' ? 0 : 1 }.each do |f|
-        loc = f[:line] ? "#{f[:file]}:#{f[:line]}" : f[:file]
-        puts "[#{f[:severity]}] #{loc}"
-        puts "        #{f[:reason]}"
-        puts "        > #{f[:raw]}" if f[:raw]
-      end
-      crit = findings.count { |f| f[:severity] == 'CRIT' }
-      warn_n = findings.count { |f| f[:severity] == 'WARN' }
-      puts "\n#{entries.size} entries checked, #{crit} CRIT, #{warn_n} WARN"
-    end
-    if visudo_result
-      status_label = visudo_result[:ok].nil? ? 'SKIPPED (visudo not found)' : (visudo_result[:ok] ? 'PASSED' : 'FAILED')
-      puts "visudo -c: #{status_label}"
-    end
+    fs.each { |f| puts format('%-6s %-16s %s:%d  %s', f.severity, f.rule, f.file, f.line, f.detail) }
+    puts "\n#{fs.count { |f| f.severity == 'HIGH' }} high, #{fs.count { |f| f.severity == 'MEDIUM' }} medium"
   end
-
-  exit_code =
-    if findings.any? { |f| f[:severity] == 'CRIT' }
-      2
-    elsif findings.any? { |f| f[:severity] == 'WARN' }
-      1
-    else
-      0
-    end
-  exit exit_code
+  exit(fs.any? { |f| %w[HIGH MEDIUM].include?(f.severity) } ? 1 : 0)
 end
