@@ -15,6 +15,9 @@ in a few minutes and dropped straight onto a box.
 | [`prometheus-exporter/prometheus_exporter.rb`](prometheus-exporter/) | Linux (portable HTTP/registry layer) | Pure-Ruby Prometheus `/metrics` HTTP exporter built on TCPServer â no prometheus-client gem, no framework. |
 | [`config-state-engine/config_state_engine.rb`](config-state-engine/) | Linux / macOS / Windows | A ~180-line idempotent, Chef/Puppet-style configuration engine: declare file/directory/line state, only touches disk on drift. |
 | [`bitlocker-compliance-audit/bitlocker_compliance_audit.rb`](bitlocker-compliance-audit/) | Windows | Audits BitLocker drive-encryption compliance via WMI (`Win32_EncryptableVolume`), classifying gaps by severity. |
+| [`tls-cert-expiry/tls_cert_expiry.rb`](tls-cert-expiry/) | Linux/macOS/Windows | Checks TLS certificate expiry across endpoints concurrently, with Nagios-style exit codes. |
+| [`sudoers-audit/sudoers_audit.rb`](sudoers-audit/) | Linux | Read-only audit of sudoers and sudoers.d for NOPASSWD ALL, wildcards, shell escapes and bad permissions. |
+| [`windows-firewall-audit/firewall_audit.rb`](windows-firewall-audit/) | Windows | Parses netsh advfirewall output to flag risky inbound allow rules and disabled profiles. |
 | [`disk-usage-report/disk_usage_report.rb`](disk-usage-report) | Linux / macOS | Disk-usage reporting with top-N offenders and JSON-snapshot growth deltas between runs, with WARN/CRIT exit codes. |
 | [`cron-audit/cron_audit.rb`](cron-audit) | Linux | Inventories every cron job, validates schedules, computes real next-run times, and flags missing/writable scripts and pipe-to-shell risks. |
 | [`eventlog-triage/eventlog_triage.rb`](eventlog-triage) | Windows | Triages System + Security event logs via WMI (`Win32_NTLogEvent`): crashes, lockouts, failed-logon bursts, new-service installs. |
