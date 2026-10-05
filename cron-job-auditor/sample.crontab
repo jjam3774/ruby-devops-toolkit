@@ -1,0 +1,9 @@
+# sample /etc/cron.d style file
+MAILTO=ops@example.com
+*/15 * * * * root /usr/local/bin/sync-metrics.sh >> /var/log/sync.log 2>&1
+0 2 * * 1-5 root /usr/bin/rsync -a /srv/ /backup/srv/
+* * * * * root /opt/scripts/heartbeat
+30 3 1 * mon deploy cleanup.sh --all
+@daily root /tmp/rotate.sh > /dev/null
+61 * * * * root /bin/true
+0 4 * * * root echo "report $(date +%F)" | logger
