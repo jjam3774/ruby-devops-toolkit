@@ -1,92 +1,89 @@
-# Disk Usage Report
+# disk-usage-report
 
-A single-pass, pure-Ruby disk usage report: biggest directories, biggest files, usage by extension and stale giants. Text or JSON output.
+Disk usage reporting and safe cleanup for Linux/macOS, in pure-Ruby stdlib (no gems required).
 
-![diagram](img/disk-usage-flow.png)
+Walks a directory tree, reports the biggest top-level subdirectories, flags individual files above a size threshold, and finds "stale junk" (old logs, `.tmp` files, core dumps, editor swap files) that's conventionally safe to reclaim — dry-run by default, with an explicit `--clean` flag (and a typed `yes` confirmation) required to actually delete anything.
+
+![Scan, classify, act pipeline](img/pipeline.png)
 
 ## Prerequisites
 
-- Ruby 3.0+ (tested on 3.3.6); standard library only (`find`, `optparse`, `json`)
-- Linux or macOS; read access to the tree you scan (unreadable entries are counted, not fatal)
-- No gems required
+- Ruby 3.0+ (tested on 3.3.6)
+- No gems — only stdlib (`find`, `optparse`, `json`, `fileutils`, `time`)
+- Read access to the directory you're scanning; `--clean` additionally needs delete permission on whatever it removes
 
 ## Usage
 
 ```bash
-ruby disk_usage_report.rb -n 5 /srv/data
+# Report only (default) — never deletes anything
+ruby disk_usage_report.rb /var
+
+# Tune thresholds and see the top 15 entries
+ruby disk_usage_report.rb /var --top 15 --large-mb 50 --stale-days 30
+
+# Machine-readable output for piping into another tool
+ruby disk_usage_report.rb /var --json
+
+# Actually delete stale junk (asks for a typed "yes" first)
+ruby disk_usage_report.rb /var/log --stale-days 30 --clean
 ```
+
+Options:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--top N` | 10 | How many top directories/files to display |
+| `--large-mb N` | 100 | Flag individual files >= N MB |
+| `--stale-days N` | 60 | Junk files older than this are "stale" |
+| `--exclude PATH` | — | Exclude a path from the scan (repeatable) |
+| `--json` | off | Emit JSON instead of text |
+| `--clean` | off | Delete stale junk after confirmation |
 
 ## How it works
 
-### `Find.find` and one-filesystem pruning
-
-`Find.find` yields every path under the root. We call `Find.prune` when a directory's device number differs from the root's, so scanning `/` will not wander into `/proc` or a network mount unless you pass `--cross-fs`.
-
-### Allocated size, not apparent size
-
-`st.blocks * 512` is the space actually allocated on disk, which is what `du` reports. Sparse files and tiny files rounded up to a block are therefore counted honestly.
-
-### Rolling sizes up the tree
-
-For every file we loop from its directory up to the root, adding the size to each ancestor in a Hash. That makes directory totals cumulative without a second pass.
-
-### Stale giants
-
-Files above `--min-stale-mb` whose mtime is older than `--stale-days` are listed separately: big, cold and probably safe to compress or move.
-
-### Failing soft
-
-`Errno::EACCES`, `ENOENT` and `EPERM` are rescued per file and counted, so one unreadable directory or a file deleted mid-scan never aborts the run.
+1. **`Find.find`** walks the tree once. Symlinks are never followed or double-counted, and any directory Ruby can't `lstat`/read (permission denied) is counted as skipped rather than raising and aborting the whole scan.
+2. **`DiskWalker#walk`** classifies every file it sees into three buckets in the same pass:
+   - `by_child` — bytes rolled up under the first path segment below the scan root (so `/var/log/*` and `/var/cache/*` both roll up cleanly when the root is `/var`)
+   - `large_files` — any single file at or above `--large-mb`
+   - `stale_files` — files matching a conservative allowlist of throwaway patterns (`*.log`, `*.log.N`, `*.log.N.gz`, `*.tmp`, `core`, `core.N`, `*.old`, editor swap/autosave files) whose mtime is older than `--stale-days`
+3. The **report** is printed as human-readable text or `--json`.
+4. **`--clean`** re-uses the already-computed `stale_files` list, prints an explicit count and total size, and requires a typed `yes` on stdin before deleting anything — it never deletes on the strength of a flag alone.
 
 ## Example output
 
-```text
-Disk usage report for /home/claude/w/tree
-Total: 100.2 MiB in 6 files (0 unreadable)
+```
+Disk usage report for /var
+Files scanned: 3  |  Unreadable dirs skipped: 0
+Total size: 158.0M
 
-== Biggest directories ==
-  57.2 MiB   57.1%  /home/claude/w/tree/cache
-  28.6 MiB   28.6%  /home/claude/w/tree/media/video
-  28.6 MiB   28.6%  /home/claude/w/tree/media
-  14.3 MiB   14.3%  /home/claude/w/tree/logs
-   8.0 KiB    0.0%  /home/claude/w/tree/src
+== Top 3 subdirectories by size ==
+  home                           150.0M  (94.9%)
+  var                              8.0M  (5.1%)
 
-== Biggest files ==
-  57.2 MiB  /home/claude/w/tree/cache/old_dump.sql
-  28.6 MiB  /home/claude/w/tree/media/video/demo.mp4
-  11.4 MiB  /home/claude/w/tree/logs/app.log
-   2.9 MiB  /home/claude/w/tree/logs/app.log.1.gz
-   8.0 KiB  /home/claude/w/tree/src/main.rb
+== Files >= 100.0M (top 3) ==
+      150.0M  /var/home/appuser/data/dataset.bin
 
-== By extension ==
-  57.2 MiB       1 files  .sql
-  28.6 MiB       1 files  .mp4
-  11.4 MiB       1 files  .log
-   2.9 MiB       1 files  .gz
-   8.0 KiB       1 files  .rb
-
-== Stale giants (>= 50 MiB, untouched 180+ days) ==
-  57.2 MiB  2025-11-01  /home/claude/w/tree/cache/old_dump.sql
+== Stale junk older than 30d (logs/tmp/core/swap) ==
+  1 files, 3.0M reclaimable
+        3.0M  /var/log/old.log.1  (mtime 2026-06-30)
 ```
 
 ## Troubleshooting
 
-- Totals smaller than `df`: deleted-but-open files and other filesystems are not visible to a tree walk; check `lsof +L1`.
-- Many unreadable entries: run with sudo or scan a narrower path.
-- Slow on huge trees: the walk is IO-bound; run it with `ionice -c3`.
-- Sizes differ slightly from `du -sh`: `du` also counts directory entries themselves; this tool counts regular files only.
+- **`Errno::EACCES` noise** — expected on directories you don't own; the script counts them in `dirs_skipped` and keeps going rather than aborting. Run with `sudo` if you need a complete picture of a system-owned path.
+- **Nothing shows up as "stale"** — `STALE_PATTERNS` is intentionally conservative (it will never flag, say, a `.rb` or `.conf` file). Extend the regex list if your fleet has other well-known junk file conventions (e.g. `*.dump`, `*.core.gz`).
+- **`--clean` asks for confirmation every time** — that's by design; it's meant to run interactively. For a cron job, pipe `yes |` into it deliberately once you trust the pattern list on that host, or script around the underlying `DiskWalker`/`clean_stale_files!` methods directly.
+- **Large filesystems are slow** — this does a single synchronous `Find.find`; for multi-terabyte trees with millions of files, consider running it scoped to one subtree at a time via `--exclude`, or pair it with `du -x` for a coarse first pass.
 
-## Extending
+## Extending it
 
-- Alert (non-zero exit) when any top directory exceeds a percentage of the filesystem.
-- Write the JSON daily and diff two days to find fast-growing directories.
-- Add an `--exclude` glob list for build caches.
-- Report inode usage per directory for filesystems that run out of inodes first.
+- Add a `--min-free-gb` flag that only runs cleanup if free space actually drops below a threshold (check via `Sys::Filesystem` or `` `df -k` ``).
+- Gzip stale logs instead of deleting them outright (`Zlib::GzipWriter`) before removing the original.
+- Emit Prometheus-format metrics (`disk_usage_bytes{dir="..."}`) instead of/alongside the text report — see the `prometheus-exporter` script elsewhere in this repo for a pure-Ruby exporter you could wire this into.
+- Add a `--older-than-access` mode using `File#atime` instead of `mtime`, for caches where "last read" matters more than "last written".
 
 ## References
 
-- [Ruby Find docs](https://docs.ruby-lang.org/en/3.3/Find.html)
-- [File::Stat#blocks](https://docs.ruby-lang.org/en/3.3/File/Stat.html)
-- [OptionParser](https://docs.ruby-lang.org/en/3.3/OptionParser.html)
-
-Part of [ruby-devops-toolkit](https://github.com/jjam3774/ruby-devops-toolkit). MIT licensed.
+- Full script + this README: [`ruby-devops-toolkit/disk-usage-report`](https://github.com/jjam3774/ruby-devops-toolkit/tree/main/disk-usage-report)
+- Ruby `Find` stdlib docs: https://docs.ruby-lang.org/en/3.3/Find.html
+- Ruby `OptionParser` docs: https://docs.ruby-lang.org/en/3.3/OptionParser.html
