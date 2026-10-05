@@ -128,6 +128,9 @@ in a few minutes and dropped straight onto a box.
 | core-dump-audit/core_dump_audit.rb | Linux | Audits Linux core-dump handling: core_pattern handler, suid_dumpable, limits.conf core limits and dump-directory disk usage, with the exact fix for each finding. |
 | cpu-saturation-monitor/cpu_saturation_monitor.rb | Linux | Splits CPU load into busy, iowait and steal from /proc/stat deltas plus load-per-core and PSI, with a hint per finding and 0/1/2 exit codes. |
 | win-uac-audit/win_uac_audit.rb | Windows | Grades User Account Control registry settings (EnableLUA, admin prompt behavior, secure desktop, remote token filtering) with the exact fix; --fixture and --self-test run off-Windows. |
+| [`disk-usage-hotspots/disk_usage_report.rb`](disk-usage-hotspots/) | Linux / macOS | Single-pass tree walk reporting biggest directories, biggest files, usage by extension and stale giants (text or JSON). |
+| [`cron-job-auditor/cron_job_auditor.rb`](cron-job-auditor/) | Linux / macOS | Pure-Ruby crontab parser: expands schedules, computes next run times and flags every-minute jobs, relative paths and world-writable scripts. |
+| [`schtasks-audit/schtasks_audit.rb`](schtasks-audit/) | Windows | Parses `schtasks /query /fo CSV /v` and flags SYSTEM tasks that run from user-writable paths, unquoted paths and failures. |
 | login-defs-audit/login_defs_audit.rb | Linux | Audits /etc/login.defs password-aging policy and checks /etc/shadow accounts that override it, with chage remediation. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
