@@ -131,6 +131,9 @@ in a few minutes and dropped straight onto a box.
 | [`disk-usage-hotspots/disk_usage_report.rb`](disk-usage-hotspots/) | Linux / macOS | Single-pass tree walk reporting biggest directories, biggest files, usage by extension and stale giants (text or JSON). |
 | [`cron-job-auditor/cron_job_auditor.rb`](cron-job-auditor/) | Linux / macOS | Pure-Ruby crontab parser: expands schedules, computes next run times and flags every-minute jobs, relative paths and world-writable scripts. |
 | [`schtasks-audit/schtasks_audit.rb`](schtasks-audit/) | Windows | Parses `schtasks /query /fo CSV /v` and flags SYSTEM tasks that run from user-writable paths, unquoted paths and failures. |
+| route-table-audit/route_table_audit.rb | Linux | Audits /proc/net/route for missing or duplicate default routes, duplicate entries and gateways outside any connected subnet. |
+| win-ntlm-audit/win_ntlm_audit.rb | Windows | Audits NTLM hardening registry settings (LmCompatibilityLevel, NoLMHash, session security) with live or snapshot mode. |
+| config-lint/config_lint.rb | Linux / macOS / Windows | Lints JSON, YAML and INI config files for syntax errors, duplicate keys, bad permissions and missing required keys. |
 | login-defs-audit/login_defs_audit.rb | Linux | Audits /etc/login.defs password-aging policy and checks /etc/shadow accounts that override it, with chage remediation. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
