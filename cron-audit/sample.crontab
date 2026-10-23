@@ -1,0 +1,6 @@
+MAILTO=ops@example.com
+*/15 * * * * /usr/local/bin/backup.sh > /var/log/backup.log 2>&1
+* * * * * check.sh
+0 3 1 * 1 /opt/report.sh
+@daily /usr/bin/logrotate /etc/logrotate.conf >/dev/null
+61 * * * * /bin/true
