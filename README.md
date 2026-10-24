@@ -135,6 +135,9 @@ in a few minutes and dropped straight onto a box.
 | win-ntlm-audit/win_ntlm_audit.rb | Windows | Audits NTLM hardening registry settings (LmCompatibilityLevel, NoLMHash, session security) with live or snapshot mode. |
 | config-lint/config_lint.rb | Linux / macOS / Windows | Lints JSON, YAML and INI config files for syntax errors, duplicate keys, bad permissions and missing required keys. |
 | login-defs-audit/login_defs_audit.rb | Linux | Audits /etc/login.defs password-aging policy and checks /etc/shadow accounts that override it, with chage remediation. |
+| proc-limits-audit/proc_limits_audit.rb | Linux | Flags processes using a high share of their soft open-files (NOFILE) limit via /proc/PID/limits and fd counts. |
+| thp-memory-audit/thp_memory_audit.rb | Linux | Audits Transparent Huge Pages mode, defrag policy and static hugepage usage. |
+| win-eventlog-size-audit/win_eventlog_size_audit.rb | Windows | Audits Event Log max size, fullness and overwrite policy via WMI Win32_NTEventlogFile. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
