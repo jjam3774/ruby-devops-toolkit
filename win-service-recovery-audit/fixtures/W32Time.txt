@@ -1,0 +1,9 @@
+[SC] QueryServiceConfig2 SUCCESS
+
+SERVICE_NAME: W32Time
+        RESET_PERIOD (in seconds)    : 0
+        REBOOT_MESSAGE               : 
+        COMMAND_LINE                 : 
+        FAILURE_ACTIONS              : NONE -- Delay = 0 milliseconds.
+                                       NONE -- Delay = 0 milliseconds.
+                                       NONE -- Delay = 0 milliseconds.

@@ -1,0 +1,7 @@
+[SC] QueryServiceConfig2 SUCCESS
+
+SERVICE_NAME: EventLog
+        RESET_PERIOD (in seconds)    : INFINITE
+        REBOOT_MESSAGE               : 
+        COMMAND_LINE                 : 
+        FAILURE_ACTIONS              : RESTART -- Delay = 60000 milliseconds.
