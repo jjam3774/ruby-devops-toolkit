@@ -138,6 +138,9 @@ in a few minutes and dropped straight onto a box.
 | proc-limits-audit/proc_limits_audit.rb | Linux | Flags processes using a high share of their soft open-files (NOFILE) limit via /proc/PID/limits and fd counts. |
 | thp-memory-audit/thp_memory_audit.rb | Linux | Audits Transparent Huge Pages mode, defrag policy and static hugepage usage. |
 | win-eventlog-size-audit/win_eventlog_size_audit.rb | Windows | Audits Event Log max size, fullness and overwrite policy via WMI Win32_NTEventlogFile. |
+| kernel-hw-error-report/kernel_hw_error_report.rb | Linux | Classifies hardware-related kernel log errors (MCE/EDAC memory, disk I/O, ATA, filesystem, PCIe AER, NVMe) from dmesg or journalctl, with per-class counts, advice and 0/1/2 exit codes. |
+| win-service-recovery-audit/win_service_recovery_audit.rb | Windows | Audits Windows service failure/recovery actions via sc.exe qfailure: missing actions, crash-loop delays, first-action reboots and non-resetting counters; fixture mode runs on Linux. |
+| env-drift-check/env_drift_check.rb | Linux / macOS / Windows | Diffs .env files against a template: missing, extra, empty, placeholder and duplicate keys, without printing values; exit codes gate deploys. |
 
 Each subdirectory has its own README with prerequisites, usage, a walkthrough of how the
 script works, example output, troubleshooting notes, and ideas for extending it.
