@@ -1,0 +1,9 @@
+[    1.100000] Linux version 6.1.0
+[  120.220000] EDAC MC0: 1 CE memory read error on DIMM_A1
+[  121.300000] EDAC MC0: 1 CE memory read error on DIMM_A1
+[  300.510000] ata1.00: failed command: READ FPDMA QUEUED
+[  301.020000] blk_update_request: I/O error, dev sda, sector 8421376
+[  301.030000] Buffer I/O error on dev sda1, logical block 1052672
+[  305.700000] EXT4-fs error (device sda1): ext4_find_entry:1455: inode #2
+[  306.000000] EXT4-fs (sda1): Remounting filesystem read-only
+[  400.000000] pcieport 0000:00:1c.0: AER: Corrected error received
